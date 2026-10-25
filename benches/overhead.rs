@@ -1,31 +1,61 @@
 //! What a zone costs: an empty zone at the top, one nested in another, and
 //! the two byte counters. The budget is what `overhead` subtracts; these
-//! keep it honest.
+//! keep it honest. No harness: each case is the median of seven rounds of
+//! ten million calls, timed by `Instant` around the round, and a case over
+//! its ceiling fails the run.
 
-use criterion::{Criterion, criterion_group, criterion_main};
 use std::hint::black_box;
+use std::time::Instant;
 use zonetrace::{Zone, copied, enter, read, take};
 
 static OUTER: Zone = Zone::new(1, "outer");
 static INNER: Zone = Zone::new(2, "inner");
 
-fn zones(c: &mut Criterion) {
-    c.bench_function("zones/enter_exit_top", |b| {
-        b.iter(|| drop(black_box(enter(&OUTER))));
-    });
-    let outer = enter(&OUTER);
-    c.bench_function("zones/enter_exit_nested", |b| {
-        b.iter(|| drop(black_box(enter(&INNER))));
-    });
-    c.bench_function("zones/count_read_and_copied", |b| {
-        b.iter(|| {
-            read(black_box(8192));
-            copied(black_box(8192));
-        });
-    });
-    drop(outer);
-    let _ = take();
+const CALLS: u32 = 10_000_000;
+const ROUNDS: usize = 7;
+
+/// Nanoseconds a call of `f`, the median round.
+fn time(mut f: impl FnMut()) -> f64 {
+    for _ in 0..CALLS / 10 {
+        f();
+    }
+    let mut rounds: Vec<f64> = (0..ROUNDS)
+        .map(|_| {
+            let start = Instant::now();
+            for _ in 0..CALLS {
+                f();
+            }
+            start.elapsed().as_secs_f64() * 1e9 / f64::from(CALLS)
+        })
+        .collect();
+    rounds.sort_by(f64::total_cmp);
+    rounds[ROUNDS / 2]
 }
 
-criterion_group!(benches, zones);
-criterion_main!(benches);
+fn main() {
+    // A ceiling far above the cost: it catches a tracer gone wrong, not a
+    // noisy machine.
+    const CEILING: f64 = 20.0;
+    let mut results = vec![("enter_exit_top", time(|| drop(black_box(enter(&OUTER)))))];
+    let outer = enter(&OUTER);
+    results.push(("enter_exit_nested", time(|| drop(black_box(enter(&INNER))))));
+    results.push((
+        "count_read_and_copied",
+        time(|| {
+            read(black_box(8192));
+            copied(black_box(8192));
+        }),
+    ));
+    drop(outer);
+    let _ = take();
+    for (name, ns) in &results {
+        println!("zones/{name:<24} {ns:>7.2} ns");
+    }
+    println!(
+        "zones/{:<24} {:>7.2} ns",
+        "overhead()",
+        zonetrace::overhead()
+    );
+    let over: Vec<_> = results.iter().filter(|(_, ns)| *ns > CEILING).collect();
+    assert!(over.is_empty(), "over {CEILING} ns: {over:?}");
+}

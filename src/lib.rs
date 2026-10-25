@@ -20,28 +20,29 @@
 //! Each thread keeps a tree of nodes, one per path of zones (a zone entered
 //! from two different zones is two nodes), and each node links to the node
 //! it ran in. A node sums its calls, its time, and the bytes the code in it
-//! said it read and copied. Nothing is recorded per call: once a path is
-//! known, entering it costs a thread-local lookup among its parent's few
-//! children and two reads of the CPU's counter (about a nanosecond each,
-//! where the system clock behind `Instant` costs about 25 on macOS), and
-//! memory stays the size of the tree. Ticks become nanoseconds only when
-//! the tree is taken.
+//! said it read and copied. Nothing is recorded per call, and memory stays
+//! the size of the tree.
+//!
+//! The hot path borrows nothing and allocates nothing. A zone entered again
+//! from where it was last entered (in a loop, every call but the first)
+//! finds its node in a small cache by zone number, without a look at the
+//! tree; its counters are cells in a fixed array that a thread-local
+//! reaches without a borrow. The time is two reads of the CPU's counter,
+//! under half a nanosecond each, where the system clock behind `Instant`
+//! costs about 18 on macOS. Ticks become nanoseconds only when the tree is
+//! taken. An empty zone costs about 4 ns in all.
 //!
 //! The tracer's own cost lands in the zone that encloses each call.
 //! [`overhead`] measures it on the running machine, and [`Report`] takes it
 //! out of every node's time by the number of zones entered beneath it, so a
 //! zone entered a million times does not inflate its parent.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::fmt::Write as _;
 use std::marker::PhantomData;
-use std::sync::LazyLock;
 use std::time::Instant;
 
-use quanta::Clock;
-
-/// The counter every zone reads, calibrated once per process.
-static CLOCK: LazyLock<Clock> = LazyLock::new(Clock::new);
+mod clock;
 
 /// A named stretch of code, declared once as a static.
 #[derive(Debug)]
@@ -75,27 +76,101 @@ impl Zone {
 /// zone is open.
 const NONE: u32 = u32::MAX;
 
-/// One path of zones on one thread.
+/// Nodes whose counters live in the fixed array [`Hot::counts`]; a tree
+/// with more keeps the rest in [`Tree::spill`], behind a borrow.
+const HOT_NODES: usize = 512;
+
+/// Entries of the cache of where each zone was last entered.
+const SLOTS: usize = 64;
+
+/// What one node has summed. Cells, so the hot path updates them with
+/// plain loads and stores and no borrow.
+#[derive(Debug)]
+struct Counts {
+    calls: Cell<u64>,
+    /// Counter ticks, not nanoseconds.
+    ticks: Cell<u64>,
+    read: Cell<u64>,
+    copied: Cell<u64>,
+}
+
+impl Counts {
+    const fn new() -> Self {
+        Self {
+            calls: Cell::new(0),
+            ticks: Cell::new(0),
+            read: Cell::new(0),
+            copied: Cell::new(0),
+        }
+    }
+
+    /// The sums, and zero left behind.
+    fn take(&self) -> [u64; 4] {
+        [
+            self.calls.take(),
+            self.ticks.take(),
+            self.read.take(),
+            self.copied.take(),
+        ]
+    }
+}
+
+/// Where a zone was last entered: from which node, as which node.
+#[derive(Debug, Clone, Copy)]
+struct Slot {
+    zone: Option<&'static Zone>,
+    parent: u32,
+    node: u32,
+}
+
+const EMPTY: Slot = Slot {
+    zone: None,
+    parent: NONE,
+    node: NONE,
+};
+
+/// A thread's hot state: nothing in it needs dropping, so reaching it is a
+/// thread-local address and no more, and nothing in it is borrowed.
+#[derive(Debug)]
+struct Hot {
+    /// The node the thread is in.
+    at: Cell<u32>,
+    /// Bumped by [`take`]: a zone opened before it does not count in the
+    /// tree after it.
+    epoch: Cell<u32>,
+    /// By zone number, modulo its length: a zone entered again from the
+    /// node it was last entered from is that node again, without a look at
+    /// the tree. In a loop that is every call but the first.
+    cache: [Cell<Slot>; SLOTS],
+    counts: [Counts; HOT_NODES],
+}
+
+impl Hot {
+    /// The counters of `node`, when they are in the fixed array.
+    fn counts(&self, node: u32) -> Option<&Counts> {
+        self.counts.get(node as usize)
+    }
+}
+
+/// One path of zones on one thread: its place in the tree. What it has
+/// summed is in [`Hot`], or in [`Tree::spill`] past [`HOT_NODES`].
 #[derive(Debug)]
 struct Node {
     zone: &'static Zone,
     parent: u32,
-    calls: u64,
-    /// Counter ticks, not nanoseconds.
-    ticks: u64,
-    read: u64,
-    copied: u64,
     /// Children in the order they were first entered: few, so a scan beats
     /// a map.
     children: Vec<u32>,
 }
 
-/// A thread's tree, and the node it is in.
+/// A thread's tree: looked at only when a zone is entered from a node it
+/// has not been entered from lately, and when the tree is taken.
 #[derive(Debug)]
 struct Tree {
     nodes: Vec<Node>,
     roots: Vec<u32>,
-    at: u32,
+    /// The counters of nodes past [`HOT_NODES`], in node order.
+    spill: Vec<Counts>,
 }
 
 impl Tree {
@@ -103,14 +178,13 @@ impl Tree {
         Self {
             nodes: Vec::new(),
             roots: Vec::new(),
-            at: NONE,
+            spill: Vec::new(),
         }
     }
 
-    /// The node `zone` is under the current one, made on its first entry;
-    /// it becomes the current node.
-    fn enter(&mut self, zone: &'static Zone) -> u32 {
-        let siblings = match self.nodes.get(self.at as usize) {
+    /// The node `zone` is under `at`, made on its first entry.
+    fn find(&mut self, at: u32, zone: &'static Zone) -> u32 {
+        let siblings = match self.nodes.get(at as usize) {
             Some(n) => &n.children,
             None => &self.roots,
         };
@@ -118,43 +192,48 @@ impl Tree {
             .iter()
             .copied()
             .find(|&c| std::ptr::eq(self.nodes[c as usize].zone, zone));
-        let node = found.unwrap_or_else(|| {
+        found.unwrap_or_else(|| {
             let id = u32::try_from(self.nodes.len()).unwrap_or(NONE - 1);
             self.nodes.push(Node {
                 zone,
-                parent: self.at,
-                calls: 0,
-                ticks: 0,
-                read: 0,
-                copied: 0,
+                parent: at,
                 children: Vec::new(),
             });
-            match self.nodes.get_mut(self.at as usize) {
+            if self.nodes.len() > HOT_NODES {
+                self.spill.push(Counts::new());
+            }
+            match self.nodes.get_mut(at as usize) {
                 Some(p) => p.children.push(id),
                 None => self.roots.push(id),
             }
             id
-        });
-        self.at = node;
-        node
+        })
     }
 
-    /// One call of `node`, `ticks` long, ended; its parent is current again.
-    fn exit(&mut self, node: u32, ticks: u64) {
-        let n = &mut self.nodes[node as usize];
-        n.calls += 1;
-        n.ticks += ticks;
-        self.at = n.parent;
-    }
-
-    /// The current node, if a zone is open.
-    fn open(&mut self) -> Option<&mut Node> {
-        self.nodes.get_mut(self.at as usize)
+    /// Runs `f` on the counters of `node`, past the fixed array.
+    fn spilled(&self, node: u32, f: impl FnOnce(&Counts)) {
+        f(&self.spill[node as usize - HOT_NODES]);
     }
 }
 
 thread_local! {
+    static HOT: Hot = const {
+        Hot {
+            at: Cell::new(NONE),
+            epoch: Cell::new(0),
+            cache: [const { Cell::new(EMPTY) }; SLOTS],
+            counts: [const { Counts::new() }; HOT_NODES],
+        }
+    };
     static TREE: RefCell<Tree> = const { RefCell::new(Tree::new()) };
+}
+
+/// Runs `f` on the counters of `node`, wherever they are.
+fn with_counts(hot: &Hot, node: u32, f: impl FnOnce(&Counts)) {
+    match hot.counts(node) {
+        Some(c) => f(c),
+        None => TREE.with_borrow(|t| t.spilled(node, f)),
+    }
 }
 
 /// An open zone; dropping it ends the call. It belongs to the thread that
@@ -163,48 +242,93 @@ thread_local! {
 #[must_use = "a zone ends when its guard drops"]
 pub struct Guard {
     node: u32,
+    parent: u32,
+    epoch: u32,
     start: u64,
     _thread: PhantomData<*const ()>,
 }
 
 /// Opens `zone` inside whatever zone is open on this thread.
+#[inline]
 pub fn enter(zone: &'static Zone) -> Guard {
-    let node = TREE.with_borrow_mut(|t| t.enter(zone));
+    let (node, parent, epoch) = HOT.with(|h| {
+        let at = h.at.get();
+        let slot = &h.cache[usize::from(zone.id) % SLOTS];
+        let last = slot.get();
+        let node = if last.parent == at && last.zone.is_some_and(|z| std::ptr::eq(z, zone)) {
+            last.node
+        } else {
+            let node = TREE.with_borrow_mut(|t| t.find(at, zone));
+            slot.set(Slot {
+                zone: Some(zone),
+                parent: at,
+                node,
+            });
+            node
+        };
+        h.at.set(node);
+        (node, at, h.epoch.get())
+    });
     // The clock is read after the bookkeeping on entry and before it on
     // exit, so the zone's own time leaves the tracer out; its parent's
     // does not, and the report takes that out.
     Guard {
         node,
-        start: CLOCK.raw(),
+        parent,
+        epoch,
+        start: clock::ticks(),
         _thread: PhantomData,
     }
 }
 
 impl Drop for Guard {
+    #[inline]
     fn drop(&mut self) {
-        let ticks = CLOCK.raw().wrapping_sub(self.start);
-        TREE.with_borrow_mut(|t| t.exit(self.node, ticks));
+        let ticks = clock::ticks().wrapping_sub(self.start);
+        HOT.with(|h| {
+            if h.epoch.get() != self.epoch {
+                return;
+            }
+            h.at.set(self.parent);
+            with_counts(h, self.node, |c| {
+                c.calls.set(c.calls.get() + 1);
+                c.ticks.set(c.ticks.get() + ticks);
+            });
+        });
     }
+}
+
+/// Adds `n` to the counter `pick` chooses, of the open zone.
+#[inline(always)]
+fn count(n: u64, pick: impl Fn(&Counts) -> &Cell<u64>) {
+    HOT.with(|h| {
+        let at = h.at.get();
+        if let Some(c) = h.counts(at) {
+            let cell = pick(c);
+            cell.set(cell.get() + n);
+        } else if at != NONE {
+            TREE.with_borrow(|t| {
+                t.spilled(at, |c| {
+                    let cell = pick(c);
+                    cell.set(cell.get() + n);
+                });
+            });
+        }
+    });
 }
 
 /// `n` bytes read from the source (a system call, a request) in the open
 /// zone. Outside any zone it is not counted.
+#[inline]
 pub fn read(n: u64) {
-    TREE.with_borrow_mut(|t| {
-        if let Some(node) = t.open() {
-            node.read += n;
-        }
-    });
+    count(n, |c| &c.read);
 }
 
 /// `n` bytes copied from one buffer to another in the open zone. Outside
 /// any zone it is not counted.
+#[inline]
 pub fn copied(n: u64) {
-    TREE.with_borrow_mut(|t| {
-        if let Some(node) = t.open() {
-            node.copied += n;
-        }
-    });
+    count(n, |c| &c.copied);
 }
 
 /// Calls of the empty zone [`overhead`] times.
@@ -213,23 +337,25 @@ const CALIBRATION_CALLS: u32 = 100_000;
 static CALIBRATION: Zone = Zone::new(u16::MAX, "zones.calibration");
 
 /// What one zone costs the zone around it, in nanoseconds: the wall time
-/// of entering and leaving an empty zone, the median of five runs on this
-/// thread. The thread's tree is left as it was.
+/// of entering and leaving an empty zone, the median of five runs. It runs
+/// on a thread of its own, so no thread's tree is touched.
 #[must_use]
 pub fn overhead() -> f64 {
-    let saved = TREE.with_borrow_mut(|t| std::mem::replace(t, Tree::new()));
-    let mut runs: Vec<f64> = (0..5)
-        .map(|_| {
-            let start = Instant::now();
-            for _ in 0..CALIBRATION_CALLS {
-                drop(enter(&CALIBRATION));
-            }
-            start.elapsed().as_secs_f64() * 1e9 / f64::from(CALIBRATION_CALLS)
-        })
-        .collect();
-    TREE.with_borrow_mut(|t| *t = saved);
-    runs.sort_by(f64::total_cmp);
-    runs[2]
+    std::thread::spawn(|| {
+        let mut runs: Vec<f64> = (0..5)
+            .map(|_| {
+                let start = Instant::now();
+                for _ in 0..CALIBRATION_CALLS {
+                    drop(enter(&CALIBRATION));
+                }
+                start.elapsed().as_secs_f64() * 1e9 / f64::from(CALIBRATION_CALLS)
+            })
+            .collect();
+        runs.sort_by(f64::total_cmp);
+        runs[2]
+    })
+    .join()
+    .unwrap_or(0.0)
 }
 
 /// One node of a report: a path of zones, and what ran in it.
@@ -263,25 +389,37 @@ pub struct Report {
     roots: Vec<u32>,
 }
 
-/// This thread's tree, as a report; the thread starts a new one. Zones open
-/// while it is taken are counted in the new tree when they end, under no
-/// parent.
+/// This thread's tree, as a report; the thread starts a new one. Zones
+/// open while it is taken are not counted in either.
 #[must_use]
 pub fn take() -> Report {
     let tree = TREE.with_borrow_mut(|t| std::mem::replace(t, Tree::new()));
+    let hot: Vec<[u64; 4]> = HOT.with(|h| {
+        h.at.set(NONE);
+        h.epoch.set(h.epoch.get().wrapping_add(1));
+        for slot in &h.cache {
+            slot.set(EMPTY);
+        }
+        h.counts[..tree.nodes.len().min(HOT_NODES)]
+            .iter()
+            .map(Counts::take)
+            .collect()
+    });
+    let counts = hot.into_iter().chain(tree.spill.iter().map(Counts::take));
     let rows = tree
         .nodes
         .into_iter()
+        .zip(counts)
         .zip(0u32..)
-        .map(|(n, id)| Row {
+        .map(|((n, [calls, ticks, read, copied]), id)| Row {
             id,
             parent: (n.parent != NONE).then_some(n.parent),
             zone: n.zone.id,
             name: n.zone.name,
-            calls: n.calls,
-            nanos: CLOCK.delta_as_nanos(0, n.ticks),
-            read: n.read,
-            copied: n.copied,
+            calls,
+            nanos: clock::nanos(ticks),
+            read,
+            copied,
             children: n.children,
         })
         .collect();
@@ -488,6 +626,56 @@ mod tests {
         assert!(rows[0].nanos >= rows[1].nanos);
         assert!(rows[1].nanos >= 150_000);
         assert_eq!(rows[0].children, vec![1]);
+    }
+
+    /// Enters OUTER and INNER in turn, `depth` deep, counting a byte read
+    /// at each level: every level is a node of its own.
+    fn nest(depth: u32) {
+        if depth == 0 {
+            return;
+        }
+        let _z = enter(if depth.is_multiple_of(2) {
+            &OUTER
+        } else {
+            &INNER
+        });
+        read(1);
+        nest(depth - 1);
+    }
+
+    #[test]
+    fn a_tree_past_the_fixed_counters_counts_the_same() {
+        let deep = u32::try_from(HOT_NODES).expect("small") + 100;
+        let _ = take();
+        nest(deep);
+        nest(deep);
+        let r = take();
+        assert_eq!(r.rows().len(), deep as usize);
+        assert!(r.rows().iter().all(|row| row.calls == 2 && row.read == 2));
+        assert_eq!(
+            r.rows()[HOT_NODES + 50].parent,
+            Some(u32::try_from(HOT_NODES).expect("small") + 49)
+        );
+    }
+
+    #[test]
+    fn a_zone_open_while_the_tree_is_taken_counts_in_neither() {
+        let _ = take();
+        let o = enter(&OUTER);
+        // Taken while open: the zone is in the tree, with no call ended.
+        let first = take();
+        assert_eq!((first.rows().len(), first.rows()[0].calls), (1, 0));
+        {
+            let _i = enter(&INNER);
+            read(3);
+        }
+        drop(o);
+        let r = take();
+        assert_eq!(r.rows().len(), 1);
+        assert_eq!(
+            (r.rows()[0].name, r.rows()[0].parent, r.rows()[0].read),
+            ("inner", None, 3)
+        );
     }
 
     #[test]

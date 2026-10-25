@@ -35,14 +35,26 @@ walk                            1   27335.812  100.0      46.338        0.0     
 
 ## The tracer's own cost
 
-A zone reads the CPU's counter on entry and exit, through `quanta`. Its
-bookkeeping falls outside its own time but inside its parent's.
+An empty zone costs about 4 ns: a lookup in a small cache, two reads of
+the CPU's counter (one instruction each, `mrs cntvct_el0` on aarch64 and
+`rdtsc` on x86_64), and two counter updates, with no borrow and no
+allocation. The crate has no dependencies. Its one `unsafe` block is the
+counter read, in `src/clock.rs`. The tracer's bookkeeping falls outside
+its own time but inside its parent's.
 `zonetrace::overhead()` measures one empty zone on the running machine, and
 a report takes that cost out of each node's time once per zone entered
 beneath it. A zone entered a million times does not inflate its parent.
 
 `just bench` measures the cost: an empty zone at the top, one nested in
-another, and the two byte counters.
+another, and the two byte counters. Measured on an Apple M-series laptop:
+
+```text
+zones/enter_exit_top              3.85 ns   (was 10.4 with quanta and RefCell)
+zones/enter_exit_nested           3.86 ns   (was 11.3)
+zones/count_read_and_copied       2.23 ns   (was 8.8)
+```
+
+Rust 1.85 or later (edition 2024).
 
 ## Development
 
