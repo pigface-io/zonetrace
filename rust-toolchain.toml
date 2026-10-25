@@ -1,0 +1,5 @@
+# The toolchain every developer and CI job uses. rustup reads this file on first
+# use, so `cargo` in this directory is always the same compiler.
+[toolchain]
+channel = "1.97.1"
+components = ["rustfmt", "clippy", "llvm-tools-preview"]

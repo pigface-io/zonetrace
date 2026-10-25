@@ -1,0 +1,44 @@
+[package]
+name = "zonetrace"
+description = "Zones: named stretches of code declared as statics, timed per thread into a call tree whose nodes link to the zone they ran in, with bytes read and copied counted per zone and the tracer's own cost measured and taken out. One dependency, the CPU counter, and no allocation per zone once a path is known."
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.97"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/pigface-io/zonetrace"
+publish = false
+
+[lints.rust]
+unsafe_code = "forbid"
+missing_docs = "warn"
+
+[lints.clippy]
+all = { level = "deny", priority = -1 }
+needless_pass_by_value = "deny"
+semicolon_if_nothing_returned = "deny"
+redundant_closure_for_method_calls = "deny"
+inefficient_to_string = "deny"
+implicit_clone = "deny"
+manual_let_else = "deny"
+unnested_or_patterns = "deny"
+map_unwrap_or = "deny"
+large_types_passed_by_value = "deny"
+ref_option = "deny"
+format_push_string = "deny"
+unreadable_literal = "deny"
+cloned_instead_of_copied = "deny"
+explicit_iter_loop = "deny"
+uninlined_format_args = "deny"
+
+[dependencies]
+quanta = { version = "0.12", default-features = false }
+
+[dev-dependencies]
+criterion = { version = "0.8", default-features = false }
+
+[[bench]]
+name = "overhead"
+harness = false
+
+[profile.release]
+debug = "line-tables-only"

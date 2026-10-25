@@ -1,0 +1,53 @@
+# Git hooks, run by prek (https://prek.j178.dev). Install them with
+# `just hooks`; run them all with `just check`.
+#:schema https://www.schemastore.org/prek.json
+
+default_install_hook_types = ["pre-commit", "pre-push"]
+default_stages = ["pre-commit"]
+
+[[repos]]
+repo = "builtin"
+hooks = [
+    { id = "trailing-whitespace" },
+    { id = "end-of-file-fixer" },
+    { id = "check-toml" },
+    { id = "check-merge-conflict" },
+    { id = "check-added-large-files", args = ["--maxkb=200"] },
+    { id = "detect-private-key" },
+]
+
+[[repos]]
+repo = "local"
+
+[[repos.hooks]]
+id = "rust-fmt"
+name = "style: rustfmt"
+language = "system"
+entry = "just fmt-check"
+files = '\.rs$'
+pass_filenames = false
+
+[[repos.hooks]]
+id = "rust-lint"
+name = "lint: clippy and rustdoc (warnings are errors)"
+language = "system"
+entry = "just lint"
+files = '^(src/|benches/|Cargo\.(toml|lock)$|rust-toolchain\.toml$)'
+pass_filenames = false
+
+[[repos.hooks]]
+id = "rust-cover"
+name = "test: every test, line coverage held to 100%"
+language = "system"
+entry = "just cover"
+files = '^(src/|Cargo\.(toml|lock)$)'
+pass_filenames = false
+
+[[repos.hooks]]
+id = "rust-bench"
+name = "bench: what a zone costs"
+language = "system"
+entry = "just bench"
+stages = ["pre-push"]
+files = '^(src/|benches/|Cargo\.(toml|lock)$)'
+pass_filenames = false
