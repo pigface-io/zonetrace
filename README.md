@@ -56,6 +56,56 @@ zones/count_read_and_copied       2.23 ns   (was 8.8)
 
 Rust 1.85 or later (edition 2024).
 
+## Deep zones: what the kernel counted
+
+`zonetrace::enter_deep(&ZONE)` opens a zone that also sums what the kernel
+counted for the thread over each call: time on a CPU, time waiting for one,
+page faults, context switches, and bytes the thread made storage read and
+write. A report shows them beside the row, with the time off both, which
+is the time the thread was blocked:
+
+```text
+zone     calls  total ms ...   cpu ms   wait ms   off ms  majflt switches   disk MB
+run          1    68.539 ...   67.680     0.015    0.845       0        0       0.0
+  sum       20    20.602 ...        -         -        -       -        -         -
+  sort      20    47.934 ...        -         -        -       -        -         -
+```
+
+That is `examples/perf_join.rs` on Linux: `run` is deep, and all but under
+a millisecond of it was on a CPU. A zone waiting on storage shows its time
+under `off ms`, with the switches and bytes that go with it.
+
+On Linux the counts come from the thread's files under `/proc/thread-self`,
+kept open and read again: plain file reads, no `unsafe`. Two snapshots cost
+a few microseconds, outside the zone's time and inside its parent's, so a
+deep zone is for a stretch of a millisecond or more. Elsewhere a deep zone
+is an ordinary zone.
+
+## Timelines: hardware counters per zone, from `perf`
+
+With the feature `timeline`, `zonetrace::timeline::start()` records each
+zone entered and left on the thread with its time, and `stop()` returns
+the recording to write out. `perf` samples the CPU's counters from outside
+the process, stamped on the same clock, and `zonetrace-join` hands each
+sample to the zone open on its thread when it was taken:
+
+```text
+perf record -k realtime -e cycles,instructions -- ./my-program   # writes run.timeline
+perf script -F tid,time,period,event --ns | zonetrace-join run.timeline
+```
+
+```text
+zone                                      cycles total      %      cycles self
+run                                          68413680  100.0                0
+  sum                                        19803960   28.9         19803960
+  sort                                       48609720   71.1         48609720
+(no zone open)                                      0    0.0                0
+```
+
+No counter is read in the process and nothing is `unsafe`; recording costs
+a push per enter and per exit. Compiled in but not recording, the feature
+adds about 1 ns to a zone. `examples/perf_join.rs` is a run to try.
+
 ## Development
 
 ```text
@@ -63,6 +113,7 @@ just hooks    install the git hooks (prek)
 just check    every hook on every file
 just cover    tests, line coverage held to 100%
 just bench    what a zone costs
+just test-linux   the tests on Linux, in a container (podman)
 ```
 
 ## Licence

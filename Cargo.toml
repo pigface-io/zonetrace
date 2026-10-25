@@ -31,6 +31,23 @@ cloned_instead_of_copied = "deny"
 explicit_iter_loop = "deny"
 uninlined_format_args = "deny"
 
+[features]
+# A thread's zones in time, for joining with `perf` samples: the module
+# timeline and the tool zonetrace-join.
+timeline = []
+
+[[bin]]
+name = "zonetrace-join"
+required-features = ["timeline"]
+
+[[example]]
+name = "perf_join"
+required-features = ["timeline"]
+
+[[test]]
+name = "join"
+required-features = ["timeline"]
+
 [[bench]]
 name = "overhead"
 harness = false

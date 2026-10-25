@@ -32,6 +32,11 @@
 //! costs about 18 on macOS. Ticks become nanoseconds only when the tree is
 //! taken. An empty zone costs about 4 ns in all.
 //!
+//! A zone opened with [`enter_deep`] also sums what the kernel counted for
+//! the thread over each call ([`Kernel`]); with the feature `timeline`,
+//! [`timeline`] records a thread's zones in time, for [`join`] to hand
+//! `perf` samples of the CPU's counters to the zones they fell in.
+//!
 //! The tracer's own cost lands in the zone that encloses each call.
 //! [`overhead`] measures it on the running machine, and [`Report`] takes it
 //! out of every node's time by the number of zones entered beneath it, so a
@@ -43,7 +48,11 @@ use std::marker::PhantomData;
 use std::time::Instant;
 
 mod clock;
+#[cfg(feature = "timeline")]
+pub mod join;
 mod kernel;
+#[cfg(feature = "timeline")]
+pub mod timeline;
 
 pub use kernel::Kernel;
 
@@ -141,6 +150,10 @@ struct Hot {
     /// Bumped by [`take`]: a zone opened before it does not count in the
     /// tree after it.
     epoch: Cell<u32>,
+    /// Whether the thread's zones are being recorded in time (feature
+    /// `timeline`): here, so a zone learns it from the state it reads
+    /// anyway.
+    recording: Cell<bool>,
     /// By zone number, modulo its length: a zone entered again from the
     /// node it was last entered from is that node again, without a look at
     /// the tree. In a loop that is every call but the first.
@@ -227,11 +240,18 @@ thread_local! {
         Hot {
             at: Cell::new(NONE),
             epoch: Cell::new(0),
+            recording: Cell::new(false),
             cache: [const { Cell::new(EMPTY) }; SLOTS],
             counts: [const { Counts::new() }; HOT_NODES],
         }
     };
     static TREE: RefCell<Tree> = const { RefCell::new(Tree::new()) };
+}
+
+/// Starts or stops recording this thread's zones in time.
+#[cfg(feature = "timeline")]
+fn set_recording(on: bool) -> bool {
+    HOT.with(|h| h.recording.replace(on))
 }
 
 /// Runs `f` on the counters of `node`, wherever they are.
@@ -257,7 +277,7 @@ pub struct Guard {
 /// Opens `zone` inside whatever zone is open on this thread.
 #[inline]
 pub fn enter(zone: &'static Zone) -> Guard {
-    let (node, parent, epoch) = HOT.with(|h| {
+    let (node, parent, epoch, recording) = HOT.with(|h| {
         let at = h.at.get();
         let slot = &h.cache[usize::from(zone.id) % SLOTS];
         let last = slot.get();
@@ -273,11 +293,17 @@ pub fn enter(zone: &'static Zone) -> Guard {
             node
         };
         h.at.set(node);
-        (node, at, h.epoch.get())
+        (node, at, h.epoch.get(), h.recording.get())
     });
     // The clock is read after the bookkeeping on entry and before it on
     // exit, so the zone's own time leaves the tracer out; its parent's
     // does not, and the report takes that out.
+    #[cfg(feature = "timeline")]
+    if recording {
+        timeline::enter(zone, clock::ticks());
+    }
+    #[cfg(not(feature = "timeline"))]
+    let _ = recording;
     Guard {
         node,
         parent,
@@ -290,8 +316,13 @@ pub fn enter(zone: &'static Zone) -> Guard {
 impl Drop for Guard {
     #[inline]
     fn drop(&mut self) {
-        let ticks = clock::ticks().wrapping_sub(self.start);
+        let end = clock::ticks();
+        let ticks = end.wrapping_sub(self.start);
         HOT.with(|h| {
+            #[cfg(feature = "timeline")]
+            if h.recording.get() {
+                timeline::exit(end);
+            }
             if h.epoch.get() != self.epoch {
                 return;
             }

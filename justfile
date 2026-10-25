@@ -25,13 +25,13 @@ fmt-check:
 
 # clippy with warnings as errors, and the docs with broken links as errors
 lint:
-    cargo clippy --all-targets --locked -- -D warnings
-    cargo clippy --all-targets --locked --target x86_64-apple-darwin -- -D warnings
-    RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --locked --quiet
+    cargo clippy --all-targets --all-features --locked -- -D warnings
+    cargo clippy --all-targets --all-features --locked --target x86_64-apple-darwin -- -D warnings
+    RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --all-features --locked --quiet
 
 # tests with line coverage, held to 100%
 cover:
-    cargo llvm-cov --locked --fail-under-lines 100
+    cargo llvm-cov --locked --all-features --fail-under-lines 100
 
 # what a zone costs, against the last saved baseline when there is one
 bench:
