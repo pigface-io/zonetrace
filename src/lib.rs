@@ -43,6 +43,9 @@ use std::marker::PhantomData;
 use std::time::Instant;
 
 mod clock;
+mod kernel;
+
+pub use kernel::Kernel;
 
 /// A named stretch of code, declared once as a static.
 #[derive(Debug)]
@@ -161,6 +164,8 @@ struct Node {
     /// Children in the order they were first entered: few, so a scan beats
     /// a map.
     children: Vec<u32>,
+    /// What the kernel counted over its deep calls, when it had any.
+    kernel: Option<Kernel>,
 }
 
 /// A thread's tree: looked at only when a zone is entered from a node it
@@ -198,6 +203,7 @@ impl Tree {
                 zone,
                 parent: at,
                 children: Vec::new(),
+                kernel: None,
             });
             if self.nodes.len() > HOT_NODES {
                 self.spill.push(Counts::new());
@@ -298,6 +304,52 @@ impl Drop for Guard {
     }
 }
 
+/// An open deep zone: a zone whose calls also sum what the kernel counted
+/// for the thread while they ran. Dropping it ends the call.
+#[derive(Debug)]
+#[must_use = "a zone ends when its guard drops"]
+pub struct DeepGuard {
+    guard: Option<Guard>,
+    start: Option<Kernel>,
+}
+
+/// Opens `zone` as [`enter`] does, and also sums what the kernel counted
+/// for this thread over the call (see [`Kernel`]): on Linux, from the
+/// thread's files under `/proc`; elsewhere nothing is added. The two reads
+/// of those files cost a few microseconds, outside the zone's own time and
+/// inside its parent's, so a deep zone is for a stretch of a millisecond or
+/// more, never an inner loop.
+pub fn enter_deep(zone: &'static Zone) -> DeepGuard {
+    let start = kernel::snapshot();
+    DeepGuard {
+        guard: Some(enter(zone)),
+        start,
+    }
+}
+
+impl Drop for DeepGuard {
+    fn drop(&mut self) {
+        // The call ends before the kernel is asked, so the second read
+        // falls outside the zone's time, as the first does.
+        let ended = self.guard.take().map(|g| {
+            let at = (g.node, g.epoch);
+            drop(g);
+            at
+        });
+        if let (Some((node, epoch)), Some(start), Some(end)) =
+            (ended, self.start, kernel::snapshot())
+        {
+            if HOT.with(|h| h.epoch.get()) == epoch {
+                let spent = end.since(&start);
+                TREE.with_borrow_mut(|t| {
+                    let n = &mut t.nodes[node as usize];
+                    n.kernel.get_or_insert_with(Kernel::default).add(&spent);
+                });
+            }
+        }
+    }
+}
+
 /// Adds `n` to the counter `pick` chooses, of the open zone.
 #[inline(always)]
 fn count(n: u64, pick: impl Fn(&Counts) -> &Cell<u64>) {
@@ -377,6 +429,8 @@ pub struct Row {
     pub read: u64,
     /// Bytes copied between buffers.
     pub copied: u64,
+    /// What the kernel counted over its deep calls (see [`enter_deep`]).
+    pub kernel: Option<Kernel>,
     /// Rows that ran in it.
     pub children: Vec<u32>,
 }
@@ -420,6 +474,7 @@ pub fn take() -> Report {
             nanos: clock::nanos(ticks),
             read,
             copied,
+            kernel: n.kernel,
             children: n.children,
         })
         .collect();
@@ -460,6 +515,9 @@ impl Report {
             r.nanos += o.nanos;
             r.read += o.read;
             r.copied += o.copied;
+            if let Some(k) = &o.kernel {
+                r.kernel.get_or_insert_with(Kernel::default).add(k);
+            }
             id
         } else {
             let id = u32::try_from(self.rows.len()).unwrap_or(NONE - 1);
@@ -511,15 +569,27 @@ impl Report {
 
     /// The tree as text: one line per row, indented under its parent, with
     /// calls, net time and its share of the top rows, net self time, MB read
-    /// and copied, and copies per byte read.
+    /// and copied, and copies per byte read. When a row has kernel counts
+    /// (see [`enter_deep`]), every line also shows time on a CPU, time
+    /// waiting for one, time off both (blocked: the net time less the two),
+    /// major faults, voluntary switches, and MB storage moved.
     #[must_use]
     pub fn text(&self, overhead: f64) -> String {
         let net = self.net_times(overhead);
         let whole: f64 = self.roots.iter().map(|&r| net[r as usize].0).sum();
+        let deep = self.rows.iter().any(|r| r.kernel.is_some());
         let mut out = format!(
-            "{:<40} {:>10} {:>11} {:>6} {:>11} {:>10} {:>10} {:>6}\n",
+            "{:<40} {:>10} {:>11} {:>6} {:>11} {:>10} {:>10} {:>6}",
             "zone", "calls", "total ms", "%", "self ms", "read MB", "copy MB", "copy/r"
         );
+        if deep {
+            let _ = write!(
+                out,
+                " {:>10} {:>10} {:>10} {:>7} {:>8} {:>9}",
+                "cpu ms", "wait ms", "off ms", "majflt", "switches", "disk MB"
+            );
+        }
+        out.push('\n');
         let mut stack: Vec<(u32, usize)> = self.roots.iter().rev().map(|&r| (r, 0)).collect();
         while let Some((id, depth)) = stack.pop() {
             let r = &self.rows[id as usize];
@@ -537,7 +607,7 @@ impl Report {
                 0.0
             };
             let label = format!("{:indent$}{}", "", r.name, indent = depth * 2);
-            let _ = writeln!(
+            let _ = write!(
                 out,
                 "{label:<40} {:>10} {:>11.3} {share:>6.1} {:>11.3} {:>10.1} {:>10.1} {ratio:>6}",
                 r.calls,
@@ -546,6 +616,36 @@ impl Report {
                 read / 1e6,
                 copied / 1e6,
             );
+            match (deep, &r.kernel) {
+                (true, Some(k)) => {
+                    #[allow(clippy::cast_precision_loss)]
+                    let (cpu, wait, disk) = (
+                        k.cpu_ns as f64,
+                        k.wait_ns as f64,
+                        (k.read_bytes + k.write_bytes) as f64,
+                    );
+                    let off = (total - cpu - wait).max(0.0);
+                    let _ = write!(
+                        out,
+                        " {:>10.3} {:>10.3} {:>10.3} {:>7} {:>8} {:>9.1}",
+                        cpu / 1e6,
+                        wait / 1e6,
+                        off / 1e6,
+                        k.major_faults,
+                        k.voluntary_switches,
+                        disk / 1e6,
+                    );
+                }
+                (true, None) => {
+                    let _ = write!(
+                        out,
+                        " {:>10} {:>10} {:>10} {:>7} {:>8} {:>9}",
+                        "-", "-", "-", "-", "-", "-"
+                    );
+                }
+                (false, _) => {}
+            }
+            out.push('\n');
             stack.extend(r.children.iter().rev().map(|&c| (c, depth + 1)));
         }
         out
@@ -553,7 +653,8 @@ impl Report {
 
     /// The tree as NDJSON, one row a line, for diffing runs: `id`,
     /// `parent`, `zone`, `name`, `calls`, `nanos` as measured, `net` and
-    /// `self` with the tracer taken out, `read`, `copied`.
+    /// `self` with the tracer taken out, `read`, `copied`, and `kernel`
+    /// when the row has kernel counts.
     #[must_use]
     pub fn ndjson(&self, overhead: f64) -> String {
         let net = self.net_times(overhead);
@@ -562,11 +663,26 @@ impl Report {
             let parent = r
                 .parent
                 .map_or_else(|| "null".to_owned(), |p| p.to_string());
-            let _ = writeln!(
+            let _ = write!(
                 out,
-                r#"{{"id":{},"parent":{parent},"zone":{},"name":"{}","calls":{},"nanos":{},"net":{total:.0},"self":{own:.0},"read":{},"copied":{}}}"#,
+                r#"{{"id":{},"parent":{parent},"zone":{},"name":"{}","calls":{},"nanos":{},"net":{total:.0},"self":{own:.0},"read":{},"copied":{}"#,
                 r.id, r.zone, r.name, r.calls, r.nanos, r.read, r.copied,
             );
+            if let Some(k) = &r.kernel {
+                let _ = write!(
+                    out,
+                    r#","kernel":{{"cpu_ns":{},"wait_ns":{},"minor_faults":{},"major_faults":{},"voluntary_switches":{},"involuntary_switches":{},"read_bytes":{},"write_bytes":{}}}"#,
+                    k.cpu_ns,
+                    k.wait_ns,
+                    k.minor_faults,
+                    k.major_faults,
+                    k.voluntary_switches,
+                    k.involuntary_switches,
+                    k.read_bytes,
+                    k.write_bytes,
+                );
+            }
+            out.push_str("}\n");
         }
         out
     }
@@ -640,6 +756,7 @@ mod tests {
             &INNER
         });
         read(1);
+        copied(1);
         nest(depth - 1);
     }
 
@@ -651,7 +768,11 @@ mod tests {
         nest(deep);
         let r = take();
         assert_eq!(r.rows().len(), deep as usize);
-        assert!(r.rows().iter().all(|row| row.calls == 2 && row.read == 2));
+        assert!(
+            r.rows()
+                .iter()
+                .all(|row| row.calls == 2 && row.read == 2 && row.copied == 2)
+        );
         assert_eq!(
             r.rows()[HOT_NODES + 50].parent,
             Some(u32::try_from(HOT_NODES).expect("small") + 49)
@@ -675,6 +796,99 @@ mod tests {
         assert_eq!(
             (r.rows()[0].name, r.rows()[0].parent, r.rows()[0].read),
             ("inner", None, 3)
+        );
+    }
+
+    #[test]
+    fn a_deep_zone_is_a_zone_with_kernel_counts_where_there_are_some() {
+        let _ = take();
+        {
+            let _d = enter_deep(&OUTER);
+            drop(enter(&INNER));
+        }
+        let r = take();
+        assert_eq!((r.rows()[0].name, r.rows()[0].calls), ("outer", 1));
+        assert_eq!(r.rows()[0].kernel.is_some(), cfg!(target_os = "linux"));
+        assert_eq!(r.rows()[1].kernel, None);
+    }
+
+    #[test]
+    fn a_deep_zone_open_while_the_tree_is_taken_counts_in_neither() {
+        let _ = take();
+        kernel::fake(Some(Kernel::default()));
+        let d = enter_deep(&OUTER);
+        let _ = take();
+        drop(d);
+        assert!(take().rows().is_empty());
+        kernel::fake(None);
+    }
+
+    #[test]
+    fn a_deep_zone_sums_what_the_kernel_counted_over_each_call() {
+        let _ = take();
+        for _ in 0..2 {
+            kernel::fake(Some(Kernel::default()));
+            let _d = enter_deep(&OUTER);
+            kernel::fake(Some(Kernel {
+                cpu_ns: 5,
+                ..Kernel::default()
+            }));
+        }
+        kernel::fake(None);
+        let r = take();
+        // On Linux the kernel's own counts stand in for the fake ones.
+        let cpu = r.rows()[0].kernel.map(|k| k.cpu_ns);
+        #[cfg(target_os = "linux")]
+        assert!(cpu.is_some());
+        #[cfg(not(target_os = "linux"))]
+        assert_eq!(cpu, Some(10));
+    }
+
+    #[test]
+    fn kernel_counts_merge_print_and_serialise() {
+        let k = Kernel {
+            cpu_ns: 2_000_000,
+            wait_ns: 1_000_000,
+            major_faults: 4,
+            voluntary_switches: 7,
+            read_bytes: 3_000_000,
+            ..Kernel::default()
+        };
+        let row = |id, parent, kernel| Row {
+            id,
+            parent,
+            zone: u16::try_from(id + 1).expect("small"),
+            name: if id == 0 { "outer" } else { "inner" },
+            calls: 1,
+            nanos: 10_000_000,
+            read: 0,
+            copied: 0,
+            kernel,
+            children: if id == 0 { vec![1] } else { Vec::new() },
+        };
+        let mut a = Report {
+            rows: vec![row(0, None, Some(k)), row(1, Some(0), None)],
+            roots: vec![0],
+        };
+        let b = a.clone();
+        a.merge(&b);
+        let got = a.rows()[0].kernel.expect("summed");
+        assert_eq!((got.cpu_ns, got.major_faults), (4_000_000, 8));
+        let text = a.text(0.0);
+        let lines: Vec<&str> = text.lines().collect();
+        assert!(lines[0].ends_with("disk MB"));
+        // 20 ms net, 4 on a CPU, 2 waiting: 14 off both.
+        assert!(lines[1].contains("14.000"), "{}", lines[1]);
+        assert!(lines[2].ends_with('-'));
+        let json = a.ndjson(0.0);
+        assert!(json.lines().next().expect("a line").ends_with(
+            r#""kernel":{"cpu_ns":4000000,"wait_ns":2000000,"minor_faults":0,"major_faults":8,"voluntary_switches":14,"involuntary_switches":0,"read_bytes":6000000,"write_bytes":0}}"#
+        ));
+        assert!(
+            json.lines()
+                .nth(1)
+                .expect("a line")
+                .ends_with(r#""copied":0}"#)
         );
     }
 

@@ -40,3 +40,7 @@ bench:
 # the oldest compiler the crate promises to build on (rust-version)
 msrv:
     cargo +1.85.0 check --lib --locked
+
+# every test on Linux, in a container (podman): the kernel counts and perf
+test-linux:
+    podman run --rm --privileged -v "$PWD":/src:ro -v zonetrace-target:/target -v zonetrace-rustup:/usr/local/rustup -e CARGO_TARGET_DIR=/target -w /src docker.io/library/rust:1-slim cargo test --locked --all-features
