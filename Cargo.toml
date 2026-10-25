@@ -1,6 +1,6 @@
 [package]
 name = "zonetrace"
-description = "Zones timed into a call tree: a polite, low-overhead Rust profiler that subtracts its own cost. About 4 ns a zone, no dependencies, kernel counts per zone on Linux, and perf samples joined to zones."
+description = "Zones timed into a call tree: a polite, low-overhead Rust profiler that subtracts its own cost. 4 to 27 ns a zone by machine, no dependencies, kernel counts per zone on Linux, and perf samples joined to zones."
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.85"

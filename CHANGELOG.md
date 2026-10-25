@@ -23,7 +23,9 @@ follow [Semantic Versioning](https://semver.org/).
 
 ### Performance
 
-- An empty zone costs about 4 ns on Apple silicon, with no dependencies:
+- An empty zone costs about 4 ns on Apple silicon, and 19 to 27 ns where
+  the CPU's counter is slower to read (x86_64, cloud aarch64), with no
+  dependencies:
   the CPU's counter read in one instruction, a cache of where each zone
   was last entered, and counters in cells that need no borrow.
 

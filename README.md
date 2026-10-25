@@ -37,7 +37,7 @@ walk                            1   27335.812  100.0      46.338        0.0     
 
 ## The tracer's own cost
 
-An empty zone costs about 4 ns: a lookup in a small cache, two reads of
+An empty zone costs about 4 ns on Apple silicon: a lookup in a small cache, two reads of
 the CPU's counter (one instruction each, `mrs cntvct_el0` on aarch64 and
 `rdtsc` on x86_64), and two counter updates, with no borrow and no
 allocation. The crate has no dependencies. Its one `unsafe` block is the
@@ -55,6 +55,19 @@ zones/enter_exit_top              3.85 ns   (was 10.4 with quanta and RefCell)
 zones/enter_exit_nested           3.86 ns   (was 11.3)
 zones/count_read_and_copied       2.23 ns   (was 8.8)
 ```
+
+The counter read sets the cost of a zone, and it depends on the machine.
+From CI runners:
+
+| Machine | enter + exit | byte counters |
+|---|---|---|
+| Apple silicon (macOS) | 4.1 ns | 2.7 ns |
+| x86_64 Linux | 19.1 ns | 2.2 ns |
+| x86_64 Windows | 21.5 ns | 3.9 ns |
+| aarch64 Linux (Neoverse, cloud) | 26.7 ns | 2.2 ns |
+
+Where a zone wraps a call of a few nanoseconds on such a machine, record a
+timeline and sample with `perf` instead.
 
 Rust 1.85 or later (edition 2024).
 

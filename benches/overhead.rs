@@ -34,8 +34,11 @@ fn time(mut f: impl FnMut()) -> f64 {
 
 fn main() {
     // A ceiling far above the cost: it catches a tracer gone wrong, not a
-    // noisy machine.
-    const CEILING: f64 = 20.0;
+    // noisy machine or a slow counter. A zone is two reads of the CPU's
+    // counter and a few loads and stores; the reads cost under half a
+    // nanosecond each on Apple silicon, about 8 ns as `rdtsc` on x86_64,
+    // and about 12 ns on the Neoverse machines of a cloud's aarch64 Linux.
+    const CEILING: f64 = 50.0;
     let mut results = vec![("enter_exit_top", time(|| drop(black_box(enter(&OUTER)))))];
     let outer = enter(&OUTER);
     results.push(("enter_exit_nested", time(|| drop(black_box(enter(&INNER))))));
