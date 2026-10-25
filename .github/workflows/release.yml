@@ -32,11 +32,13 @@ jobs:
         run: |
           awk -v v="${GITHUB_REF_NAME#v}" '
             /^## / { on = index($0, "[" v "]") > 0; next }
-            on' CHANGELOG.md > notes.md
-          test -s notes.md
+            on' CHANGELOG.md > "$RUNNER_TEMP/notes.md"
+          test -s "$RUNNER_TEMP/notes.md"
+      # Outside the checkout: cargo publish refuses a working tree with
+      # files git does not know.
       - uses: softprops/action-gh-release@v2
         with:
-          body_path: notes.md
+          body_path: ${{ runner.temp }}/notes.md
       # crates.io takes trusted publishing only for a crate that exists, so
       # the first version goes with a token in the secret
       # CARGO_REGISTRY_TOKEN; once trusted publishing is set up there, the
