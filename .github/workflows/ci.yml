@@ -27,15 +27,6 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --locked --all-features
       - run: cargo test --locked
-      - name: What a zone costs here
-        shell: bash
-        run: |
-          set -o pipefail
-          cargo bench --locked --bench overhead 2>&1 | tee bench.txt
-      - name: The costs, as a notice
-        if: always()
-        shell: bash
-        run: echo "::notice title=zone costs (${{ matrix.os }})::$(grep zones/ bench.txt | tr -s ' ' | paste -sd ';' -)"
 
   lint:
     runs-on: macos-latest

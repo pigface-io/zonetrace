@@ -46,10 +46,9 @@ pass_filenames = false
 
 [[repos.hooks]]
 id = "rust-bench"
-name = "bench: what a zone costs"
+name = "bench: what a zone costs, held to its ceiling"
 language = "system"
 entry = "just bench"
-stages = ["pre-push"]
 files = '^(src/|benches/|Cargo\.(toml|lock)$)'
 pass_filenames = false
 
