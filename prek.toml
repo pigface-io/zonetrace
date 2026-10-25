@@ -51,3 +51,12 @@ entry = "just bench"
 stages = ["pre-push"]
 files = '^(src/|benches/|Cargo\.(toml|lock)$)'
 pass_filenames = false
+
+[[repos.hooks]]
+id = "rust-msrv"
+name = "build: on the oldest Rust it promises (rust-version)"
+language = "system"
+entry = "just msrv"
+stages = ["pre-push"]
+files = '^(src/|Cargo\.(toml|lock)$)'
+pass_filenames = false

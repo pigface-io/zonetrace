@@ -26,6 +26,7 @@ fmt-check:
 # clippy with warnings as errors, and the docs with broken links as errors
 lint:
     cargo clippy --all-targets --locked -- -D warnings
+    cargo clippy --all-targets --locked --target x86_64-apple-darwin -- -D warnings
     RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --locked --quiet
 
 # tests with line coverage, held to 100%
@@ -35,3 +36,7 @@ cover:
 # what a zone costs, against the last saved baseline when there is one
 bench:
     cargo bench --locked --bench overhead
+
+# the oldest compiler the crate promises to build on (rust-version)
+msrv:
+    cargo +1.85.0 check --lib --locked
