@@ -342,33 +342,30 @@ impl Report {
         }
     }
 
-    /// Calls of every zone beneath `row`, at any depth.
-    fn beneath(&self, row: u32) -> u64 {
-        self.rows[row as usize]
-            .children
-            .iter()
-            .map(|&c| self.rows[c as usize].calls + self.beneath(c))
-            .sum()
-    }
-
-    /// `row`'s time with the tracer taken out: its measured time less
-    /// `overhead` for every zone entered beneath it.
-    fn net(&self, row: u32, overhead: f64) -> f64 {
-        let r = &self.rows[row as usize];
-        #[allow(clippy::cast_precision_loss)]
-        let t = r.nanos as f64 - self.beneath(row) as f64 * overhead;
-        t.max(0.0)
-    }
-
     /// Each row's time with the tracer taken out, and the part of it not
-    /// spent in its children, in nanoseconds, by row number.
+    /// spent in its children, in nanoseconds, by row number. One pass from
+    /// the last row up: a row's number is always above its parent's, so the
+    /// calls beneath every row are summed before its parent needs them.
     #[must_use]
     pub fn net_times(&self, overhead: f64) -> Vec<(f64, f64)> {
-        (0u32..)
-            .zip(&self.rows)
-            .map(|(id, r)| {
-                let total = self.net(id, overhead);
-                let inner: f64 = r.children.iter().map(|&c| self.net(c, overhead)).sum();
+        let mut beneath = vec![0u64; self.rows.len()];
+        for r in self.rows.iter().rev() {
+            if let Some(p) = r.parent {
+                beneath[p as usize] += r.calls + beneath[r.id as usize];
+            }
+        }
+        #[allow(clippy::cast_precision_loss)]
+        let net: Vec<f64> = self
+            .rows
+            .iter()
+            .zip(&beneath)
+            .map(|(r, &b)| (r.nanos as f64 - b as f64 * overhead).max(0.0))
+            .collect();
+        self.rows
+            .iter()
+            .zip(&net)
+            .map(|(r, &total)| {
+                let inner: f64 = r.children.iter().map(|&c| net[c as usize]).sum();
                 (total, (total - inner).max(0.0))
             })
             .collect()
@@ -519,6 +516,27 @@ mod tests {
         let huge = r.net_times(1e12);
         assert_eq!(huge[0], (0.0, 0.0));
         assert_eq!(huge[1], raw[1]);
+    }
+
+    #[test]
+    fn the_tracer_is_taken_out_at_every_depth() {
+        let _ = take();
+        {
+            let _o = enter(&OUTER);
+            for _ in 0..10 {
+                let _i = enter(&INNER);
+                for _ in 0..10 {
+                    drop(enter(&OTHER));
+                }
+            }
+        }
+        let r = take();
+        let raw = r.net_times(0.0);
+        let net = r.net_times(1.0);
+        // Outer has 10 inner and 100 other beneath it; inner has the 100.
+        assert!((raw[0].0 - net[0].0 - 110.0).abs() < 1e-6);
+        assert!((raw[1].0 - net[1].0 - 100.0).abs() < 1e-6);
+        assert_eq!(raw[2], net[2]);
     }
 
     #[test]
