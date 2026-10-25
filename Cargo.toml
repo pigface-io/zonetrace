@@ -1,12 +1,19 @@
 [package]
 name = "zonetrace"
-description = "Zones: named stretches of code declared as statics, timed per thread into a call tree whose nodes link to the zone they ran in, with bytes read and copied counted per zone and the tracer's own cost measured and taken out. No dependencies, and no allocation per zone once a path is known."
+description = "Zones timed into a call tree: a polite, low-overhead Rust profiler that subtracts its own cost. About 4 ns a zone, no dependencies, kernel counts per zone on Linux, and perf samples joined to zones."
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.85"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/pigface-io/zonetrace"
-publish = false
+documentation = "https://docs.rs/zonetrace"
+readme = "README.md"
+keywords = ["profiler", "tracing", "instrumentation", "performance", "perf"]
+categories = ["development-tools::profiling"]
+exclude = [".github/", "prek.toml", "justfile"]
+
+[package.metadata.docs.rs]
+all-features = true
 
 [lints.rust]
 # One module reads the CPU counter; it allows unsafe code, and says why.
