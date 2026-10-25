@@ -474,6 +474,35 @@ pub struct Report {
     roots: Vec<u32>,
 }
 
+/// Every thread's tree flushed so far, merged.
+static FLUSHED: std::sync::Mutex<Report> = std::sync::Mutex::new(Report {
+    rows: Vec::new(),
+    roots: Vec::new(),
+});
+
+fn flushed() -> std::sync::MutexGuard<'static, Report> {
+    FLUSHED
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Merges this thread's tree into the process's, and starts the thread a
+/// new one: for the threads of a pool, at the end of each task, so
+/// [`take_all`] sees them all. A lock is taken once per flush, never per
+/// zone.
+pub fn flush() {
+    let mine = take();
+    flushed().merge(&mine);
+}
+
+/// Every tree flushed so far and this thread's, merged into one report;
+/// both start again.
+#[must_use]
+pub fn take_all() -> Report {
+    flush();
+    std::mem::take(&mut *flushed())
+}
+
 /// This thread's tree, as a report; the thread starts a new one. Zones
 /// open while it is taken are not counted in either.
 #[must_use]
@@ -921,6 +950,37 @@ mod tests {
                 .expect("a line")
                 .ends_with(r#""copied":0}"#)
         );
+    }
+
+    #[test]
+    fn threads_flush_into_one_report() {
+        let _ = take_all();
+        let workers: Vec<_> = (0..4)
+            .map(|_| {
+                std::thread::spawn(|| {
+                    for _ in 0..2 {
+                        {
+                            let _o = enter(&OUTER);
+                            read(1);
+                        }
+                        flush();
+                    }
+                })
+            })
+            .collect();
+        for w in workers {
+            w.join().expect("a worker");
+        }
+        drop(enter(&OTHER));
+        let all = take_all();
+        let calls: Vec<(&str, u64, u64)> = all
+            .rows()
+            .iter()
+            .map(|r| (r.name, r.calls, r.read))
+            .collect();
+        assert!(calls.contains(&("outer", 8, 8)), "{calls:?}");
+        assert!(calls.iter().any(|c| c.0 == "other"), "{calls:?}");
+        assert!(take_all().rows().is_empty());
     }
 
     #[test]

@@ -12,7 +12,8 @@ follow [Semantic Versioning](https://semver.org/).
   time, and bytes read and copied per path of zones.
 - The tracer's own cost, measured by `overhead()` and taken out of every
   row of a report.
-- Reports that merge across threads, and print as a table or as NDJSON.
+- Reports that merge across threads, and print as a table or as NDJSON;
+  `flush` and `take_all` gather the threads of a pool into one.
 - Deep zones (`enter_deep`): what the kernel counted for the thread over
   each call, on Linux: time on a CPU and waiting for one, page faults,
   context switches, and bytes moved to and from storage.

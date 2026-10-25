@@ -23,7 +23,9 @@ bytes the code in it said it read and copied. Nothing is recorded per
 call, so memory stays the size of the tree however long the program runs.
 
 `zonetrace::take()` returns the thread's tree as a `Report`. Reports of
-several threads merge by path. A report prints as an indented table or as
+several threads merge by path. In a thread pool, call `zonetrace::flush()`
+at the end of each task; `zonetrace::take_all()` then returns every
+thread's zones as one report. A report prints as an indented table or as
 NDJSON, one row a line, for diffing runs:
 
 ```text
