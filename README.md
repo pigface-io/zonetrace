@@ -48,10 +48,13 @@ a report takes that cost out of each node's time once per zone entered
 beneath it. A zone entered a million times does not inflate its parent.
 
 `just bench` measures the cost: an empty zone at the top, one nested in
-another, and the two byte counters. Measured on an Apple M-series laptop:
+another, the same two inside a function of their own, and the two byte
+counters. Measured on an Apple M-series laptop:
 
 ```text
 zones/enter_exit_top              3.85 ns   (was 10.4 with quanta and RefCell)
+zones/zone_in_fn                  3.93 ns   (was 5.3 before enter inlined)
+zones/nested_in_fn                3.88 ns   (was 10.1)
 zones/enter_exit_nested           3.86 ns   (was 11.3)
 zones/count_read_and_copied       2.23 ns   (was 8.8)
 ```

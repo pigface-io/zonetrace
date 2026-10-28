@@ -255,11 +255,37 @@ fn set_recording(on: bool) -> bool {
 }
 
 /// Runs `f` on the counters of `node`, wherever they are.
+#[inline(always)]
 fn with_counts(hot: &Hot, node: u32, f: impl FnOnce(&Counts)) {
     match hot.counts(node) {
         Some(c) => f(c),
-        None => TREE.with_borrow(|t| t.spilled(node, f)),
+        None => with_spilled(node, f),
     }
+}
+
+/// Runs `f` on the counters of a node past the hot array. Out of line, so
+/// the closures of `enter` and `drop` stay small enough to inline into the
+/// caller's crate: inlined, a zone costs a third less, and nested zones
+/// share one lookup of the thread-local.
+#[cold]
+#[inline(never)]
+fn with_spilled(node: u32, f: impl FnOnce(&Counts)) {
+    TREE.with_borrow(|t| t.spilled(node, f));
+}
+
+/// Finds the node of `zone` under `at` in the tree, and remembers it in
+/// `slot`: the first call of a zone from a parent, out of line for the
+/// reason `with_spilled` is.
+#[cold]
+#[inline(never)]
+fn miss(slot: &Cell<Slot>, at: u32, zone: &'static Zone) -> u32 {
+    let node = TREE.with_borrow_mut(|t| t.find(at, zone));
+    slot.set(Slot {
+        zone: Some(zone),
+        parent: at,
+        node,
+    });
+    node
 }
 
 /// An open zone; dropping it ends the call. It belongs to the thread that
@@ -275,7 +301,7 @@ pub struct Guard {
 }
 
 /// Opens `zone` inside whatever zone is open on this thread.
-#[inline]
+#[inline(always)]
 pub fn enter(zone: &'static Zone) -> Guard {
     let (node, parent, epoch, recording) = HOT.with(|h| {
         let at = h.at.get();
@@ -284,13 +310,7 @@ pub fn enter(zone: &'static Zone) -> Guard {
         let node = if last.parent == at && last.zone.is_some_and(|z| std::ptr::eq(z, zone)) {
             last.node
         } else {
-            let node = TREE.with_borrow_mut(|t| t.find(at, zone));
-            slot.set(Slot {
-                zone: Some(zone),
-                parent: at,
-                node,
-            });
-            node
+            miss(slot, at, zone)
         };
         h.at.set(node);
         (node, at, h.epoch.get(), h.recording.get())
@@ -314,7 +334,7 @@ pub fn enter(zone: &'static Zone) -> Guard {
 }
 
 impl Drop for Guard {
-    #[inline]
+    #[inline(always)]
     fn drop(&mut self) {
         let end = clock::ticks();
         let ticks = end.wrapping_sub(self.start);

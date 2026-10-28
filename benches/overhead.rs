@@ -1,5 +1,6 @@
 //! What a zone costs: an empty zone at the top, one nested in another, and
-//! the two byte counters. The budget is what `overhead` subtracts; these
+//! the two byte counters; then the same zones inside a function of their
+//! own, as code that uses the crate has them. The budget is what `overhead` subtracts; these
 //! keep it honest. No harness: each case is the median of seven rounds of
 //! ten million calls, timed by `Instant` around the round, and a case over
 //! its ceiling fails the run.
@@ -10,6 +11,21 @@ use zonetrace::{Zone, copied, enter, read, take};
 
 static OUTER: Zone = Zone::new(1, "outer");
 static INNER: Zone = Zone::new(2, "inner");
+
+/// An empty zone in a function the loop calls: unlike a zone in the loop
+/// itself, its lookup of the thread-local cannot leave the loop, so the
+/// case fails if `enter` or `drop` stops inlining into the caller.
+#[inline(never)]
+fn zone_in_fn() {
+    let _z = enter(&OUTER);
+}
+
+/// Two zones, one in the other, in a function the loop calls.
+#[inline(never)]
+fn nested_in_fn() {
+    let _o = enter(&OUTER);
+    let _i = enter(&INNER);
+}
 
 const CALLS: u32 = 10_000_000;
 const ROUNDS: usize = 7;
@@ -44,6 +60,8 @@ fn main() {
         50.0
     };
     let mut results = vec![("enter_exit_top", time(|| drop(black_box(enter(&OUTER)))))];
+    results.push(("zone_in_fn", time(zone_in_fn)));
+    results.push(("nested_in_fn", time(nested_in_fn)));
     let outer = enter(&OUTER);
     results.push(("enter_exit_nested", time(|| drop(black_box(enter(&INNER))))));
     results.push((
