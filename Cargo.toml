@@ -1,7 +1,7 @@
 [package]
 name = "zonetrace"
 description = "Zones timed into a call tree: a polite, low-overhead Rust profiler that subtracts its own cost. 4 to 27 ns a zone by machine, no dependencies, kernel counts per zone on Linux, and perf samples joined to zones."
-version = "0.1.2"
+version = "0.1.3"
 edition = "2024"
 rust-version = "1.85"
 license = "MIT OR Apache-2.0"
@@ -10,7 +10,7 @@ documentation = "https://docs.rs/zonetrace"
 readme = "README.md"
 keywords = ["profiler", "tracing", "instrumentation", "performance", "perf"]
 categories = ["development-tools::profiling"]
-exclude = [".github/", "prek.toml", "justfile"]
+exclude = [".github/", "prek.toml", "justfile", "js/", "package.json"]
 
 [package.metadata.docs.rs]
 all-features = true

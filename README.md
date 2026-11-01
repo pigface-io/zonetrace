@@ -124,6 +124,41 @@ No counter is read in the process and nothing is `unsafe`; recording costs
 a push per enter and per exit. Compiled in but not recording, the feature
 adds about 1 ns to a zone. `examples/perf_join.rs` is a run to try.
 
+## From JavaScript
+
+The same model is under `js/`, for a browser or Bun, and installs as the
+npm package `zonetrace` from this repository (`bun add
+github:pigface-io/zonetrace#v0.1.3`). A zone is declared where its code
+lives; `enter` returns its node and `exit` of that node ends the call:
+
+```js
+import { zone, enter, exit, read, take, overhead } from "zonetrace";
+
+const LOAD = zone(1, "chunk.load");
+
+function load(buf) {
+  const z = enter(LOAD);
+  // ... the work the zone times ...
+  read(buf.byteLength);
+  exit(z);
+}
+
+zones.on = true;
+load(buf);
+console.log(take().text(overhead()));
+```
+
+With `zones.on` false, `enter` returns null and a zone costs one branch,
+so a page can ship its zones. `take()` gives a `Report` whose `text()` and
+`ndjson()` are the crate's formats, held to them by `tests/format.rs` and
+`js/zonetrace.test.ts` through one fixture. `countHeap(f)`, with `f` a
+function returning the heap's size in bytes (`performance.memory
+.usedJSHeapSize` in Chrome, `heapStats().heapCapacity` from `bun:jsc`),
+also sums what the heap grew by in each call, and a call the collector
+ran through counts under `gc` instead: a steady state that is preallocated
+shows zero. The clock is `performance.now()` in a browser, where it is
+coarse, so read a zone there as a mean over many calls.
+
 ## Development
 
 ```text
@@ -131,6 +166,7 @@ just hooks    install the git hooks (prek)
 just check    every hook on every file
 just cover    tests, line coverage held to 100%
 just bench    what a zone costs
+just js-test  the JavaScript port's tests
 just test-linux   the tests on Linux, in a container (podman)
 ```
 

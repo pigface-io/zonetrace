@@ -33,6 +33,10 @@ lint:
 cover:
     cargo llvm-cov --locked --all-features --fail-under-lines 100
 
+# the JavaScript port's tests, and its formats against the crate's fixture
+js-test:
+    bun test js/
+
 # what a zone costs, against the last saved baseline when there is one
 bench:
     cargo bench --locked --bench overhead

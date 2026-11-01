@@ -1,0 +1,13 @@
+{
+  "name": "zonetrace",
+  "version": "0.1.3",
+  "description": "Zones timed into a call tree: the JavaScript port of the zonetrace Rust crate, with the same report formats",
+  "type": "module",
+  "license": "MIT OR Apache-2.0",
+  "repository": "github:pigface-io/zonetrace",
+  "exports": "./js/zonetrace.js",
+  "files": [
+    "js/zonetrace.js"
+  ],
+  "sideEffects": false
+}

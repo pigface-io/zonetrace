@@ -1,0 +1,3 @@
+{"id":0,"parent":null,"zone":1,"name":"outer","calls":1,"nanos":X,"net":X,"self":X,"read":1234567,"copied":0}
+{"id":1,"parent":0,"zone":2,"name":"inner","calls":2,"nanos":X,"net":X,"self":X,"read":0,"copied":623456}
+{"id":2,"parent":null,"zone":3,"name":"other","calls":1,"nanos":X,"net":X,"self":X,"read":2000000,"copied":0}

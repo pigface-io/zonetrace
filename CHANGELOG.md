@@ -4,6 +4,17 @@ All notable changes to zonetrace. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and versions
 follow [Semantic Versioning](https://semver.org/).
 
+## [0.1.3] - 2026-11-01
+
+### Added
+
+- A JavaScript port under `js/`, the same model in a browser or under
+  Bun: `zone`, `enter`/`exit`, `read`/`copied`, `overhead`, `take`, and a
+  `Report` whose `text` and `ndjson` match the crate's, a fixture test
+  holding the two to one format. With `countHeap`, each call also sums
+  what the heap grew by, for a check that a steady state allocates
+  nothing. The npm package `zonetrace` from this repository is that port.
+
 ## [0.1.2] - 2026-10-28
 
 ### Fixed

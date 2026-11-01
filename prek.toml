@@ -53,6 +53,14 @@ files = '^(src/|benches/|Cargo\.(toml|lock)$)'
 pass_filenames = false
 
 [[repos.hooks]]
+id = "js-test"
+name = "test: the JavaScript port, against the crate's formats"
+language = "system"
+entry = "just js-test"
+files = '^(js/|src/lib\.rs$|tests/format\.rs$)'
+pass_filenames = false
+
+[[repos.hooks]]
 id = "rust-msrv"
 name = "build: on the oldest Rust it promises (rust-version)"
 language = "system"

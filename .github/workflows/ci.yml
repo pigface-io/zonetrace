@@ -51,6 +51,14 @@ jobs:
           tool: cargo-llvm-cov
       - run: cargo llvm-cov --locked --all-features --fail-under-lines 100
 
+  js:
+    name: js port
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+      - run: bun test js/
+
   msrv:
     runs-on: ubuntu-latest
     steps:
