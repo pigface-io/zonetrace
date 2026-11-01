@@ -124,11 +124,11 @@ const CALIBRATION = zone(65535, "zones.calibration");
 
 // What one zone costs the zone around it, in nanoseconds: an empty zone
 // entered and left `k` times, the median of five runs, on a tree of its
-// own so the report's tree is untouched.
+// own so the report's tree is untouched. With a heap probe set, its two
+// reads are in the cost, as they are in every zone.
 export function overhead(k = 100000) {
   const saved = [zones.on, zones.cur, zones.heap, zones.nodes];
   zones.on = true;
-  zones.heap = null;
   const runs = [];
   for (let r = 0; r < 5; r++) {
     zones.cur = { id: -1, children: [] };
