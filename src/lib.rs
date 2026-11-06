@@ -434,6 +434,70 @@ pub fn copied(n: u64) {
     count(n, |c| &c.copied);
 }
 
+/// Records `calls` calls totalling `nanos` on `path`, a path of zones with
+/// the outermost first, in the process's report ([`take_all`]), from any
+/// thread: for a stretch no guard can hold, one across an `.await` or one
+/// that ends on another thread. The ancestors on the path only place the
+/// row; their own calls and time come from their own guards or stretches.
+/// Takes the report's lock once, so for stages, never for rows. An empty
+/// path records nothing.
+pub fn add(path: &[&'static Zone], calls: u64, nanos: u64) {
+    let Some(last) = path.len().checked_sub(1) else {
+        return;
+    };
+    let rows = path
+        .iter()
+        .enumerate()
+        .map(|(i, z)| {
+            let id = u32::try_from(i).unwrap_or(NONE - 1);
+            let leaf = i == last;
+            Row {
+                id,
+                parent: id.checked_sub(1),
+                zone: z.id,
+                name: z.name,
+                calls: if leaf { calls } else { 0 },
+                nanos: if leaf { nanos } else { 0 },
+                read: 0,
+                copied: 0,
+                kernel: None,
+                children: if leaf { Vec::new() } else { vec![id + 1] },
+            }
+        })
+        .collect();
+    let one = Report {
+        rows,
+        roots: vec![0],
+    };
+    flushed().merge(&one);
+}
+
+/// A stretch of time recorded by [`add`] when it drops: one call of the
+/// last zone of its path, under the ones before it. It is `Send`, so it may
+/// be held across an `.await` or moved to the thread that finishes the
+/// work; it reads the system clock twice, so it is for stages, never rows.
+#[must_use = "a stretch is recorded when it drops"]
+#[derive(Debug)]
+pub struct Stretch {
+    path: &'static [&'static Zone],
+    start: Instant,
+}
+
+/// Starts a [`Stretch`] on `path` (outermost zone first).
+pub fn stretch(path: &'static [&'static Zone]) -> Stretch {
+    Stretch {
+        path,
+        start: Instant::now(),
+    }
+}
+
+impl Drop for Stretch {
+    fn drop(&mut self) {
+        let nanos = u64::try_from(self.start.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        add(self.path, 1, nanos);
+    }
+}
+
 /// Calls of the empty zone [`overhead`] times.
 const CALIBRATION_CALLS: u32 = 100_000;
 
@@ -972,8 +1036,65 @@ mod tests {
         );
     }
 
+    static STAGE: [&Zone; 2] = [&OUTER, &INNER];
+
+    /// The tests that use the process's report run one at a time.
+    static PROCESS_REPORT: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn a_stretch_from_any_thread_lands_on_its_path_and_adds_onto_a_flushed_tree() {
+        let _serial = PROCESS_REPORT
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _ = take_all();
+        // A zone on this thread, flushed; then a stretch on another thread on
+        // the same path, and one call added by hand: they sum into one row.
+        {
+            let _o = enter(&OUTER);
+            let _i = enter(&INNER);
+        }
+        flush();
+        let worker = std::thread::spawn(|| {
+            let s = stretch(&STAGE);
+            spin(50);
+            drop(s);
+        });
+        worker.join().expect("a worker");
+        add(&STAGE, 1, 1_000);
+        add(&[], 7, 7);
+        let all = take_all();
+        let rows: Vec<(&str, Option<u32>, u64)> = all
+            .rows()
+            .iter()
+            .map(|r| (r.name, r.parent, r.calls))
+            .collect();
+        assert_eq!(
+            rows,
+            [("outer", None, 1), ("inner", Some(0), 3)],
+            "{rows:?}"
+        );
+        let inner = &all.rows()[1];
+        assert!(inner.nanos >= 50_000 + 1_000, "{}", inner.nanos);
+        // A path nobody entered: the ancestors only place the row.
+        add(&[&OTHER, &INNER], 2, 20);
+        let all = take_all();
+        let rows: Vec<(&str, u64, u64)> = all
+            .rows()
+            .iter()
+            .map(|r| (r.name, r.calls, r.nanos))
+            .collect();
+        assert_eq!(rows, [("other", 0, 0), ("inner", 2, 20)], "{rows:?}");
+        fn assert_send<T: Send + Sync>() {}
+        assert_send::<Stretch>();
+        assert!(format!("{:?}", stretch(&STAGE)).contains("Stretch"));
+        let _ = take_all();
+    }
+
     #[test]
     fn threads_flush_into_one_report() {
+        let _serial = PROCESS_REPORT
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let _ = take_all();
         let workers: Vec<_> = (0..4)
             .map(|_| {

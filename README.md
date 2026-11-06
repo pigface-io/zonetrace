@@ -99,6 +99,34 @@ a few microseconds, outside the zone's time and inside its parent's, so a
 deep zone is for a stretch of a millisecond or more. Elsewhere a deep zone
 is an ordinary zone.
 
+## Stretches: time no guard can hold
+
+A guard belongs to the thread that opened it, so it cannot live across an
+`.await` (the future would not be `Send`) or end on another thread, and a
+thread that never exits never flushes its tree. For such a stretch,
+`zonetrace::stretch(&PATH)` returns a `Send` `Stretch` that records one
+call of the last zone of `PATH`, under the ones before it, straight into
+the process's report when it drops; `zonetrace::add(&PATH, calls, nanos)`
+records a count by hand:
+
+```rust
+use zonetrace::Zone;
+
+static RUN: Zone = Zone::new(30, "run");
+static FETCH: Zone = Zone::new(31, "run.fetch");
+static FETCH_PATH: [&Zone; 2] = [&RUN, &FETCH];
+
+async fn fetch_all() {
+    let _s = zonetrace::stretch(&FETCH_PATH);
+    // ... awaits, on whichever threads the runtime chooses ...
+}
+```
+
+The ancestors on the path only place the row; their own time comes from
+their own guards or stretches. A stretch reads the system clock twice and
+takes the report's lock once, so it is for stages, never for rows; the hot
+path of `enter` is untouched.
+
 ## Timelines: hardware counters per zone, from `perf`
 
 With the feature `timeline`, `zonetrace::timeline::start()` records each

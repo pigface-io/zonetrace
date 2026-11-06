@@ -4,6 +4,17 @@ All notable changes to zonetrace. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and versions
 follow [Semantic Versioning](https://semver.org/).
 
+## [0.1.4] - 2026-11-06
+
+### Added
+
+- `add(path, calls, nanos)` records calls on a path of zones in the
+  process's report from any thread, and `stretch(path)` returns a `Send`
+  `Stretch` that records one call when it drops: for the stretches no
+  guard can hold, one across an `.await` or one that ends on another
+  thread. The hot path is untouched; a stretch reads the system clock
+  twice and takes the report's lock once, so it is for stages, never rows.
+
 ## [0.1.3] - 2026-11-01
 
 ### Added
