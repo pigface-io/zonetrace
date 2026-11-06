@@ -76,8 +76,14 @@ fn the_formats_match_the_fixture() {
         std::fs::write(format!("{dir}/tree.txt"), &text).expect("write");
         std::fs::write(format!("{dir}/tree.ndjson"), &rows).expect("write");
     }
-    let want_text = std::fs::read_to_string(format!("{dir}/tree.txt")).expect("tree.txt");
-    let want_rows = std::fs::read_to_string(format!("{dir}/tree.ndjson")).expect("tree.ndjson");
+    // A checkout on Windows may give the fixtures CRLF line ends.
+    let fixture = |name: &str| {
+        std::fs::read_to_string(format!("{dir}/{name}"))
+            .expect(name)
+            .replace("\r\n", "\n")
+    };
+    let want_text = fixture("tree.txt");
+    let want_rows = fixture("tree.ndjson");
     assert_eq!(text, want_text);
     assert_eq!(rows, want_rows);
 }
