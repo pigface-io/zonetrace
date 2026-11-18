@@ -4,6 +4,33 @@ All notable changes to zonetrace. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and versions
 follow [Semantic Versioning](https://semver.org/).
 
+## [0.2.0] - 2026-11-19
+
+### Added
+
+- The feature `heap`: `heap::Counting`, a global allocator that books each
+  allocator call to the zone open on its thread. A `Row` carries its own
+  allocations, bytes allocated, reallocations and their growth, frees,
+  bytes freed, and peak live bytes above where its calls began.
+  - What the tracer allocates goes to the row `zones.tracer`, and never
+    to a zone.
+  - The rows `zones.outside` and `zones.unplaced` hold the rest, so every
+    call lands in exactly one row; `heap::thread_totals()` gives the sums
+    to check that against.
+  - `heap::overhead()` measures what booking a call costs, and a report
+    takes it out of each row's time.
+  - `text` and `ndjson` show the counts when a row has any, and print as
+    before when none does.
+- `Report::net_times_with(zone, event)`: net times with both costs given.
+
+### Changed
+
+- `Row` has a new public field, `heap`, so code that builds a `Row` by
+  hand must set it. This is the breaking change behind 0.2.
+- `just bench` runs three builds: the feature off, on, and on with the
+  allocator installed. It fails when the feature adds more than half a
+  nanosecond a zone, or more than half the cost.
+
 ## [0.1.4] - 2026-11-06
 
 ### Added
@@ -71,6 +98,9 @@ follow [Semantic Versioning](https://semver.org/).
   the CPU's counter read in one instruction, a cache of where each zone
   was last entered, and counters in cells that need no borrow.
 
+[0.2.0]: https://github.com/pigface-io/zonetrace/releases/tag/v0.2.0
+[0.1.4]: https://github.com/pigface-io/zonetrace/releases/tag/v0.1.4
+[0.1.3]: https://github.com/pigface-io/zonetrace/releases/tag/v0.1.3
 [0.1.2]: https://github.com/pigface-io/zonetrace/releases/tag/v0.1.2
 [0.1.1]: https://github.com/pigface-io/zonetrace/releases/tag/v0.1.1
 [0.1.0]: https://github.com/pigface-io/zonetrace/releases/tag/v0.1.0

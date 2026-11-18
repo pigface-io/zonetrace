@@ -35,7 +35,10 @@
 //! A zone opened with [`enter_deep`] also sums what the kernel counted for
 //! the thread over each call ([`Kernel`]); with the feature `timeline`,
 //! [`timeline`] records a thread's zones in time, for [`join`] to hand
-//! `perf` samples of the CPU's counters to the zones they fell in.
+//! `perf` samples of the CPU's counters to the zones they fell in. With
+//! the feature `heap` and its allocator installed, a node also sums what
+//! its code did to the heap, the tracer's own allocations kept apart
+//! ([`heap`]).
 //!
 //! The tracer's own cost lands in the zone that encloses each call.
 //! [`overhead`] measures it on the running machine, and [`Report`] takes it
@@ -48,13 +51,25 @@ use std::marker::PhantomData;
 use std::time::Instant;
 
 mod clock;
+pub mod heap;
 #[cfg(feature = "timeline")]
 pub mod join;
 mod kernel;
 #[cfg(feature = "timeline")]
 pub mod timeline;
 
+pub use heap::Heap;
 pub use kernel::Kernel;
+
+#[cfg(feature = "heap")]
+use heap::as_tracer;
+
+/// Runs `f` as the tracer; without the feature `heap`, just runs it.
+#[cfg(not(feature = "heap"))]
+#[inline(always)]
+fn as_tracer<R>(f: impl FnOnce() -> R) -> R {
+    f()
+}
 
 /// A named stretch of code, declared once as a static.
 #[derive(Debug)]
@@ -104,6 +119,18 @@ struct Counts {
     ticks: Cell<u64>,
     read: Cell<u64>,
     copied: Cell<u64>,
+    /// What the node's own code did to the heap (feature `heap`).
+    #[cfg(feature = "heap")]
+    heap: heap::Cells,
+}
+
+/// What [`Counts::take`] gives: the sums of one node.
+struct Taken {
+    calls: u64,
+    ticks: u64,
+    read: u64,
+    copied: u64,
+    heap: Option<Heap>,
 }
 
 impl Counts {
@@ -113,17 +140,23 @@ impl Counts {
             ticks: Cell::new(0),
             read: Cell::new(0),
             copied: Cell::new(0),
+            #[cfg(feature = "heap")]
+            heap: heap::Cells::new(),
         }
     }
 
     /// The sums, and zero left behind.
-    fn take(&self) -> [u64; 4] {
-        [
-            self.calls.take(),
-            self.ticks.take(),
-            self.read.take(),
-            self.copied.take(),
-        ]
+    fn take(&self) -> Taken {
+        Taken {
+            calls: self.calls.take(),
+            ticks: self.ticks.take(),
+            read: self.read.take(),
+            copied: self.copied.take(),
+            #[cfg(feature = "heap")]
+            heap: self.heap.take(),
+            #[cfg(not(feature = "heap"))]
+            heap: None,
+        }
     }
 }
 
@@ -159,6 +192,9 @@ struct Hot {
     /// the tree. In a loop that is every call but the first.
     cache: [Cell<Slot>; SLOTS],
     counts: [Counts; HOT_NODES],
+    /// The heap's books beside the nodes' (feature `heap`).
+    #[cfg(feature = "heap")]
+    books: heap::Books,
 }
 
 impl Hot {
@@ -243,6 +279,8 @@ thread_local! {
             recording: Cell::new(false),
             cache: [const { Cell::new(EMPTY) }; SLOTS],
             counts: [const { Counts::new() }; HOT_NODES],
+            #[cfg(feature = "heap")]
+            books: heap::Books::new(),
         }
     };
     static TREE: RefCell<Tree> = const { RefCell::new(Tree::new()) };
@@ -279,7 +317,7 @@ fn with_spilled(node: u32, f: impl FnOnce(&Counts)) {
 #[cold]
 #[inline(never)]
 fn miss(slot: &Cell<Slot>, at: u32, zone: &'static Zone) -> u32 {
-    let node = TREE.with_borrow_mut(|t| t.find(at, zone));
+    let node = as_tracer(|| TREE.with_borrow_mut(|t| t.find(at, zone)));
     slot.set(Slot {
         zone: Some(zone),
         parent: at,
@@ -297,13 +335,17 @@ pub struct Guard {
     parent: u32,
     epoch: u32,
     start: u64,
+    /// Where the heap stood when the call began (feature `heap`).
+    #[cfg(feature = "heap")]
+    mark: heap::Mark,
     _thread: PhantomData<*const ()>,
 }
 
 /// Opens `zone` inside whatever zone is open on this thread.
 #[inline(always)]
 pub fn enter(zone: &'static Zone) -> Guard {
-    let (node, parent, epoch, recording) = HOT.with(|h| {
+    #[cfg_attr(not(feature = "heap"), allow(unused_variables))]
+    let (node, parent, epoch, recording, mark) = HOT.with(|h| {
         let at = h.at.get();
         let slot = &h.cache[usize::from(zone.id) % SLOTS];
         let last = slot.get();
@@ -313,7 +355,11 @@ pub fn enter(zone: &'static Zone) -> Guard {
             miss(slot, at, zone)
         };
         h.at.set(node);
-        (node, at, h.epoch.get(), h.recording.get())
+        #[cfg(feature = "heap")]
+        let mark = heap::Mark::begin(&h.books);
+        #[cfg(not(feature = "heap"))]
+        let mark = ();
+        (node, at, h.epoch.get(), h.recording.get(), mark)
     });
     // The clock is read after the bookkeeping on entry and before it on
     // exit, so the zone's own time leaves the tracer out; its parent's
@@ -329,6 +375,8 @@ pub fn enter(zone: &'static Zone) -> Guard {
         parent,
         epoch,
         start: clock::ticks(),
+        #[cfg(feature = "heap")]
+        mark,
         _thread: PhantomData,
     }
 }
@@ -343,6 +391,10 @@ impl Drop for Guard {
             if h.recording.get() {
                 timeline::exit(end);
             }
+            // The mark is given back even for a call a take cut off, so
+            // the call around it keeps its peak.
+            #[cfg(feature = "heap")]
+            let peak = self.mark.end(&h.books);
             if h.epoch.get() != self.epoch {
                 return;
             }
@@ -350,6 +402,8 @@ impl Drop for Guard {
             with_counts(h, self.node, |c| {
                 c.calls.set(c.calls.get() + 1);
                 c.ticks.set(c.ticks.get() + ticks);
+                #[cfg(feature = "heap")]
+                c.heap.keep_peak(peak);
             });
         });
     }
@@ -371,7 +425,7 @@ pub struct DeepGuard {
 /// inside its parent's, so a deep zone is for a stretch of a millisecond or
 /// more, never an inner loop.
 pub fn enter_deep(zone: &'static Zone) -> DeepGuard {
-    let start = kernel::snapshot();
+    let start = as_tracer(kernel::snapshot);
     DeepGuard {
         guard: Some(enter(zone)),
         start,
@@ -388,7 +442,7 @@ impl Drop for DeepGuard {
             at
         });
         if let (Some((node, epoch)), Some(start), Some(end)) =
-            (ended, self.start, kernel::snapshot())
+            (ended, self.start, as_tracer(kernel::snapshot))
         {
             if HOT.with(|h| h.epoch.get()) == epoch {
                 let spent = end.since(&start);
@@ -442,6 +496,10 @@ pub fn copied(n: u64) {
 /// Takes the report's lock once, so for stages, never for rows. An empty
 /// path records nothing.
 pub fn add(path: &[&'static Zone], calls: u64, nanos: u64) {
+    as_tracer(|| add_row(path, calls, nanos));
+}
+
+fn add_row(path: &[&'static Zone], calls: u64, nanos: u64) {
     let Some(last) = path.len().checked_sub(1) else {
         return;
     };
@@ -460,6 +518,7 @@ pub fn add(path: &[&'static Zone], calls: u64, nanos: u64) {
                 nanos: if leaf { nanos } else { 0 },
                 read: 0,
                 copied: 0,
+                heap: None,
                 kernel: None,
                 children: if leaf { Vec::new() } else { vec![id + 1] },
             }
@@ -544,11 +603,23 @@ pub struct Row {
     pub read: u64,
     /// Bytes copied between buffers.
     pub copied: u64,
+    /// What its own code did to the heap, when it did anything and the
+    /// binary counts the heap (see [`heap`]).
+    pub heap: Option<Heap>,
     /// What the kernel counted over its deep calls (see [`enter_deep`]).
     pub kernel: Option<Kernel>,
     /// Rows that ran in it.
     pub children: Vec<u32>,
 }
+
+/// The rows a report gives the heap's books (feature `heap`): zones no
+/// code enters, numbered from the top of the range down.
+#[cfg(feature = "heap")]
+static BOOKS: [Zone; 3] = [
+    Zone::new(u16::MAX - 1, "zones.tracer"),
+    Zone::new(u16::MAX - 2, "zones.outside"),
+    Zone::new(u16::MAX - 3, "zones.unplaced"),
+];
 
 /// A thread's call tree, taken by [`take`]; reports of several threads
 /// [`merge`](Report::merge) into one.
@@ -575,24 +646,32 @@ fn flushed() -> std::sync::MutexGuard<'static, Report> {
 /// [`take_all`] sees them all. A lock is taken once per flush, never per
 /// zone.
 pub fn flush() {
-    let mine = take();
-    flushed().merge(&mine);
+    as_tracer(|| {
+        let mine = take_tree();
+        flushed().merge_rows(&mine);
+    });
 }
 
 /// Every tree flushed so far and this thread's, merged into one report;
 /// both start again.
 #[must_use]
 pub fn take_all() -> Report {
-    flush();
-    std::mem::take(&mut *flushed())
+    as_tracer(|| {
+        flush();
+        std::mem::take(&mut *flushed())
+    })
 }
 
 /// This thread's tree, as a report; the thread starts a new one. Zones
 /// open while it is taken are not counted in either.
 #[must_use]
 pub fn take() -> Report {
+    as_tracer(take_tree)
+}
+
+fn take_tree() -> Report {
     let tree = TREE.with_borrow_mut(|t| std::mem::replace(t, Tree::new()));
-    let hot: Vec<[u64; 4]> = HOT.with(|h| {
+    let hot: Vec<Taken> = HOT.with(|h| {
         h.at.set(NONE);
         h.epoch.set(h.epoch.get().wrapping_add(1));
         for slot in &h.cache {
@@ -609,23 +688,56 @@ pub fn take() -> Report {
         .into_iter()
         .zip(counts)
         .zip(0u32..)
-        .map(|((n, [calls, ticks, read, copied]), id)| Row {
+        .map(|((n, t), id)| Row {
             id,
             parent: (n.parent != NONE).then_some(n.parent),
             zone: n.zone.id,
             name: n.zone.name,
-            calls,
-            nanos: clock::nanos(ticks),
-            read,
-            copied,
+            calls: t.calls,
+            nanos: clock::nanos(t.ticks),
+            read: t.read,
+            copied: t.copied,
+            heap: t.heap,
             kernel: n.kernel,
             children: n.children,
         })
         .collect();
-    Report {
+    #[cfg_attr(not(feature = "heap"), allow(unused_mut))]
+    let mut report = Report {
         rows,
         roots: tree.roots,
+    };
+    #[cfg(feature = "heap")]
+    {
+        // Room for the books' rows first: nothing is allocated after the
+        // books are read, so the tracer's row holds all the take cost.
+        report.rows.reserve(BOOKS.len());
+        report.roots.reserve(BOOKS.len());
+        let books = HOT.with(|h| {
+            let b = &h.books;
+            [b.tracer.take(), b.outside.take(), b.unplaced.take()]
+        });
+        for (zone, heap) in BOOKS.iter().zip(books) {
+            if heap.is_some() {
+                let id = u32::try_from(report.rows.len()).unwrap_or(NONE - 1);
+                report.rows.push(Row {
+                    id,
+                    parent: None,
+                    zone: zone.id,
+                    name: zone.name,
+                    calls: 0,
+                    nanos: 0,
+                    read: 0,
+                    copied: 0,
+                    heap,
+                    kernel: None,
+                    children: Vec::new(),
+                });
+                report.roots.push(id);
+            }
+        }
     }
+    report
 }
 
 impl Report {
@@ -638,6 +750,10 @@ impl Report {
     /// Adds `other` in: rows on the same path of zone numbers are summed,
     /// the others are added.
     pub fn merge(&mut self, other: &Self) {
+        as_tracer(|| self.merge_rows(other));
+    }
+
+    fn merge_rows(&mut self, other: &Self) {
         for &r in &other.roots {
             self.merge_row(other, r, None);
         }
@@ -659,6 +775,9 @@ impl Report {
             r.nanos += o.nanos;
             r.read += o.read;
             r.copied += o.copied;
+            if let Some(h) = &o.heap {
+                r.heap.get_or_insert_with(Heap::default).add(h);
+            }
             if let Some(k) = &o.kernel {
                 r.kernel.get_or_insert_with(Kernel::default).add(k);
             }
@@ -686,20 +805,48 @@ impl Report {
     /// spent in its children, in nanoseconds, by row number. One pass from
     /// the last row up: a row's number is always above its parent's, so the
     /// calls beneath every row are summed before its parent needs them.
+    ///
+    /// When rows counted the heap, booking each allocator call cost time
+    /// too, inside the zone that made it: that comes off by the events in
+    /// each row and beneath it, at what [`heap::overhead`] measured once
+    /// for the process.
     #[must_use]
     pub fn net_times(&self, overhead: f64) -> Vec<(f64, f64)> {
+        as_tracer(|| self.net_times_with(overhead, self.event_cost()))
+    }
+
+    /// What booking one allocator call costs, when a row counted any.
+    fn event_cost(&self) -> f64 {
+        #[cfg(feature = "heap")]
+        if self.rows.iter().any(|r| r.heap.is_some()) {
+            return heap::cost();
+        }
+        0.0
+    }
+
+    /// [`net_times`](Report::net_times) with both costs given: `zone` per
+    /// zone entered beneath a row, `event` per allocator call booked in it
+    /// or beneath it.
+    #[must_use]
+    pub fn net_times_with(&self, zone: f64, event: f64) -> Vec<(f64, f64)> {
         let mut beneath = vec![0u64; self.rows.len()];
+        let mut events: Vec<u64> = self
+            .rows
+            .iter()
+            .map(|r| r.heap.map_or(0, |h| h.events()))
+            .collect();
         for r in self.rows.iter().rev() {
             if let Some(p) = r.parent {
                 beneath[p as usize] += r.calls + beneath[r.id as usize];
+                events[p as usize] += events[r.id as usize];
             }
         }
         #[allow(clippy::cast_precision_loss)]
         let net: Vec<f64> = self
             .rows
             .iter()
-            .zip(&beneath)
-            .map(|(r, &b)| (r.nanos as f64 - b as f64 * overhead).max(0.0))
+            .zip(beneath.iter().zip(&events))
+            .map(|(r, (&b, &e))| (r.nanos as f64 - b as f64 * zone - e as f64 * event).max(0.0))
             .collect();
         self.rows
             .iter()
@@ -716,16 +863,31 @@ impl Report {
     /// and copied, and copies per byte read. When a row has kernel counts
     /// (see [`enter_deep`]), every line also shows time on a CPU, time
     /// waiting for one, time off both (blocked: the net time less the two),
-    /// major faults, voluntary switches, and MB storage moved.
+    /// major faults, voluntary switches, and MB storage moved. When a row
+    /// counted the heap (see [`heap`]), every line also shows its own MB
+    /// allocated, allocations, reallocations and MB freed, and the peak MB
+    /// live above where its calls began.
     #[must_use]
     pub fn text(&self, overhead: f64) -> String {
-        let net = self.net_times(overhead);
+        as_tracer(|| self.text_rows(overhead))
+    }
+
+    fn text_rows(&self, overhead: f64) -> String {
+        let net = self.net_times_with(overhead, self.event_cost());
         let whole: f64 = self.roots.iter().map(|&r| net[r as usize].0).sum();
         let deep = self.rows.iter().any(|r| r.kernel.is_some());
+        let counted = self.rows.iter().any(|r| r.heap.is_some());
         let mut out = format!(
             "{:<40} {:>10} {:>11} {:>6} {:>11} {:>10} {:>10} {:>6}",
             "zone", "calls", "total ms", "%", "self ms", "read MB", "copy MB", "copy/r"
         );
+        if counted {
+            let _ = write!(
+                out,
+                " {:>10} {:>10} {:>9} {:>10} {:>9}",
+                "alloc MB", "allocs", "realloc", "freed MB", "peak MB"
+            );
+        }
         if deep {
             let _ = write!(
                 out,
@@ -760,6 +922,29 @@ impl Report {
                 read / 1e6,
                 copied / 1e6,
             );
+            match (counted, &r.heap) {
+                (true, Some(h)) => {
+                    #[allow(clippy::cast_precision_loss)]
+                    let (bytes, freed, peak) = (h.bytes as f64, h.freed as f64, h.peak as f64);
+                    let _ = write!(
+                        out,
+                        " {:>10.1} {:>10} {:>9} {:>10.1} {:>9.1}",
+                        bytes / 1e6,
+                        h.allocs,
+                        h.reallocs,
+                        freed / 1e6,
+                        peak / 1e6,
+                    );
+                }
+                (true, None) => {
+                    let _ = write!(
+                        out,
+                        " {:>10} {:>10} {:>9} {:>10} {:>9}",
+                        "-", "-", "-", "-", "-"
+                    );
+                }
+                (false, _) => {}
+            }
             match (deep, &r.kernel) {
                 (true, Some(k)) => {
                     #[allow(clippy::cast_precision_loss)]
@@ -797,11 +982,17 @@ impl Report {
 
     /// The tree as NDJSON, one row a line, for diffing runs: `id`,
     /// `parent`, `zone`, `name`, `calls`, `nanos` as measured, `net` and
-    /// `self` with the tracer taken out, `read`, `copied`, and `kernel`
-    /// when the row has kernel counts.
+    /// `self` with the tracer taken out, `read`, `copied`, `heap` when the
+    /// row counted the heap (`bytes`, `allocs`, `reallocs`,
+    /// `realloc_bytes`, `frees`, `freed`, `peak`), and `kernel` when it has
+    /// kernel counts.
     #[must_use]
     pub fn ndjson(&self, overhead: f64) -> String {
-        let net = self.net_times(overhead);
+        as_tracer(|| self.ndjson_rows(overhead))
+    }
+
+    fn ndjson_rows(&self, overhead: f64) -> String {
+        let net = self.net_times_with(overhead, self.event_cost());
         let mut out = String::new();
         for (r, (total, own)) in self.rows.iter().zip(net) {
             let parent = r
@@ -812,6 +1003,13 @@ impl Report {
                 r#"{{"id":{},"parent":{parent},"zone":{},"name":"{}","calls":{},"nanos":{},"net":{total:.0},"self":{own:.0},"read":{},"copied":{}"#,
                 r.id, r.zone, r.name, r.calls, r.nanos, r.read, r.copied,
             );
+            if let Some(h) = &r.heap {
+                let _ = write!(
+                    out,
+                    r#","heap":{{"bytes":{},"allocs":{},"reallocs":{},"realloc_bytes":{},"frees":{},"freed":{},"peak":{}}}"#,
+                    h.bytes, h.allocs, h.reallocs, h.realloc_bytes, h.frees, h.freed, h.peak,
+                );
+            }
             if let Some(k) = &r.kernel {
                 let _ = write!(
                     out,
@@ -1007,6 +1205,7 @@ mod tests {
             nanos: 10_000_000,
             read: 0,
             copied: 0,
+            heap: None,
             kernel,
             children: if id == 0 { vec![1] } else { Vec::new() },
         };
@@ -1242,6 +1441,42 @@ mod tests {
         );
         assert!(lines[1].contains(r#""parent":0"#));
         assert!(lines[1].ends_with(r#""read":1000000,"copied":2000000}"#));
+    }
+
+    /// The unit tests' binary installs no allocator: with the feature on,
+    /// nothing is booked, and the formats are the plain ones.
+    #[test]
+    fn with_no_counting_allocator_the_heap_is_absent() {
+        let _ = take();
+        {
+            let _o = enter(&OUTER);
+            drop(std::hint::black_box(Vec::<u8>::with_capacity(4096)));
+        }
+        let r = take();
+        assert!(r.rows().iter().all(|x| x.heap.is_none()));
+        assert_eq!(r.rows().len(), 1);
+        assert!(!r.text(0.0).contains("alloc MB"));
+        assert!(!r.ndjson(0.0).contains("heap"));
+        #[cfg(feature = "heap")]
+        assert_eq!(heap::thread_totals(), (Heap::default(), Heap::default()));
+    }
+
+    #[test]
+    fn heap_counts_add_and_subtract() {
+        let a = Heap {
+            allocs: 2,
+            bytes: 10,
+            reallocs: 1,
+            realloc_bytes: 4,
+            frees: 1,
+            freed: 3,
+            peak: 7,
+        };
+        let mut b = a;
+        b.add(&Heap { peak: 9, ..a });
+        assert_eq!(b.events(), 8);
+        assert_eq!((b.bytes, b.peak), (20, 9));
+        assert_eq!(b.since(&a), Heap { peak: 9, ..a });
     }
 
     #[test]

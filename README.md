@@ -41,7 +41,8 @@ An empty zone costs about 4 ns on Apple silicon: a lookup in a small cache, two 
 the CPU's counter (one instruction each, `mrs cntvct_el0` on aarch64 and
 `rdtsc` on x86_64), and two counter updates, with no borrow and no
 allocation. The crate has no dependencies. Its one `unsafe` block is the
-counter read, in `src/clock.rs`. The tracer's bookkeeping falls outside
+counter read, in `src/clock.rs`; with the feature `heap`, the counting
+allocator in `src/heap/count.rs` is the other. The tracer's bookkeeping falls outside
 its own time but inside its parent's.
 `zonetrace::overhead()` measures one empty zone on the running machine, and
 a report takes that cost out of each node's time once per zone entered
@@ -98,6 +99,65 @@ kept open and read again: plain file reads, no `unsafe`. Two snapshots cost
 a few microseconds, outside the zone's time and inside its parent's, so a
 deep zone is for a stretch of a millisecond or more. Elsewhere a deep zone
 is an ordinary zone.
+
+## Heap: what each zone allocated
+
+With the feature `heap`, a binary that installs the counting allocator
+has each allocator call booked to the zone open on its thread:
+
+```rust
+#[global_allocator]
+static HEAP: zonetrace::heap::Counting<std::alloc::System> =
+    zonetrace::heap::Counting::new(std::alloc::System);
+```
+
+A node then sums its own allocations, the bytes allocated (fresh, and
+what a reallocation grew by), its reallocations, and the bytes freed. It
+also keeps the most bytes live above where each of its calls began,
+children included. The report shows them beside each row:
+
+```text
+zone        calls ... alloc MB     allocs   realloc   freed MB   peak MB
+outer           1 ...      2.0          1         0        2.0       2.0
+  inner         1 ...        -          -         -          -         -
+zones.tracer    0 ...      0.0          3         0        0.0       0.0
+```
+
+**What the tracer allocates is its own.** This covers a new path's node,
+taking and merging reports, and formatting them. It is booked to the row
+`zones.tracer` and never to a zone.
+
+**Two more rows complete the books:**
+- `zones.outside`: what the thread did with no zone open;
+- `zones.unplaced`: what a node past the fixed counters did, on a thread
+  with over 512 paths.
+
+Every allocator call lands in exactly one row. `heap::thread_totals()`
+gives the thread's running sums, so a test can check that nothing was
+lost or counted twice.
+
+**Frees and stretches:**
+- A block freed on another thread is booked where it is freed.
+- A stretch carries no heap counts.
+
+**Cost:** booking never allocates, borrows or locks. It is a few loads and
+stores to the thread's own cells. Booking one call costs about 2 ns,
+inside the zone that made it. `heap::overhead()` measures it, and a report
+takes it out of each row's time by the calls in and beneath it, as it does
+the zones'.
+
+**What the feature adds to a zone:** a zone with the feature on keeps the
+heap's high-water mark on its guard. `just bench` times every case three
+ways and fails when the feature, on or installed, adds more than half a
+nanosecond a zone or half the cost. Measured on an Apple M-series laptop:
+
+```text
+case                         off        on   installed
+zones/enter_exit_top        1.62      2.07      2.08
+zones/zone_in_fn            1.54      1.73      1.61
+zones/nested_in_fn          2.32      3.01      3.00
+zones/enter_exit_nested     1.57      2.05      2.02
+```
 
 ## Stretches: time no guard can hold
 
@@ -193,7 +253,7 @@ coarse, so read a zone there as a mean over many calls.
 just hooks    install the git hooks (prek)
 just check    every hook on every file
 just cover    tests, line coverage held to 100%
-just bench    what a zone costs
+just bench    what a zone costs, the feature heap off, on and installed
 just js-test  the JavaScript port's tests
 just test-linux   the tests on Linux, in a container (podman)
 ```

@@ -49,7 +49,7 @@ id = "rust-bench"
 name = "bench: what a zone costs, held to its ceiling"
 language = "system"
 entry = "just bench"
-files = '^(src/|benches/|Cargo\.(toml|lock)$)'
+files = '^(src/|benches/|scripts/|Cargo\.(toml|lock)$)'
 pass_filenames = false
 
 [[repos.hooks]]

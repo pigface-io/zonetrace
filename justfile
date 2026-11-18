@@ -37,9 +37,10 @@ cover:
 js-test:
     bun test js/
 
-# what a zone costs, against the last saved baseline when there is one
+# what a zone costs with the feature heap off, on, and its allocator installed,
+# each held to its ceiling and the heap cases to their gates against off
 bench:
-    cargo bench --locked --bench overhead
+    scripts/bench-gate.sh
 
 # the oldest compiler the crate promises to build on (rust-version)
 msrv:

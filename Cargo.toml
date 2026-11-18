@@ -1,7 +1,7 @@
 [package]
 name = "zonetrace"
 description = "Zones timed into a call tree: a polite, low-overhead Rust profiler that subtracts its own cost. 4 to 27 ns a zone by machine, no dependencies, kernel counts per zone on Linux, and perf samples joined to zones."
-version = "0.1.4"
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.85"
 license = "MIT OR Apache-2.0"
@@ -42,6 +42,9 @@ uninlined_format_args = "deny"
 # A thread's zones in time, for joining with `perf` samples: the module
 # timeline and the tool zonetrace-join.
 timeline = []
+# What the code in each zone did to the heap, through the allocator
+# `heap::Counting` the binary installs.
+heap = []
 
 [[bin]]
 name = "zonetrace-join"
@@ -61,3 +64,12 @@ harness = false
 
 [profile.release]
 debug = "line-tables-only"
+
+[[test]]
+name = "heap"
+required-features = ["heap"]
+
+[[bench]]
+name = "overhead_heap"
+harness = false
+required-features = ["heap"]
